@@ -5,6 +5,7 @@ import pydiffvg
 import time
 import gc
 import contextlib
+import weakref
 from enum import IntEnum
 import warnings
 
@@ -344,6 +345,12 @@ def _build_scene_impl(args):
     for shape_group_id in range(num_shape_groups):
         shape_ids = _np(args[current_index], np.int32)
         current_index += 1
+        if shape_ids.size == 0:
+            # the C++ core hangs on these (BVH build of zero leaves)
+            raise ValueError('shape group %d has no shapes: not supported by the C++ scene '
+                             'construction (CPU backend, or set_gpu_scene_builder(\'cpu\')); '
+                             'use the GPU backend with set_gpu_scene_builder(\'gpu\') or drop '
+                             'the empty group' % shape_group_id)
         fill_color_type = args[current_index]
         current_index += 1
         fill_color, current_index = \
@@ -463,90 +470,263 @@ def _eval_positions_arg(args):
     ev = args[6]
     return ev if ev is not None and ev.shape[0] > 0 else None
 
-def _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args,
-                 built = None):
+# ---------------------------------------------------------------------------
+# GPU scene construction (Metal backend)
+#
+# 'gpu' (default): pydiffvg/scene_gpu.py builds the flat pools directly from
+# the serialized args with MLX ops and GPU BVH builds; the structure-only part
+# (topology) is cached across calls. 'cpu': the C++ core builds a diffvg.Scene
+# (_build_scene) and export_flat copies it (the reference; also the fallback
+# for scenes scene_gpu rejects).
+
+_gpu_scene_builder = 'gpu'
+_scene_refit = True
+
+# BVH refit policy (builder 'gpu'). While only float parameters change between
+# calls (same topology), the BVHs of the previous call are refit (same leaf
+# order and tree, boxes recomputed bottom-up) instead of rebuilt. A refit BVH
+# is always a valid BVH, so results do not depend on the policy; only the
+# traversal cost can grow as leaves drift away from their Morton / y order.
+# The BVHs are rebuilt
+# - after REFIT_MAX_CALLS consecutive refits, and
+# - when the tree quality drops: for each BVH kind (path, group, scene), the
+#   ratio of the summed half-perimeters of the internal nodes to that of the
+#   leaves (a surface-area-heuristic proxy for the expected number of visited
+#   nodes, independent of uniform scaling) exceeds its value at the last
+#   rebuild by more than REFIT_MAX_GROWTH. The ratio is read from the previous
+#   call's pools, which are already evaluated then, so the check never blocks.
+REFIT_MAX_CALLS = 20
+REFIT_MAX_GROWTH = 0.10
+
+def set_gpu_scene_builder(builder):
     """
-        Builds the C++ scene (unless `built` is given) and exports its pools.
-        Returns {'scene': built, 'flat': prepare_flat dict} for 'color', or
-        {'scene': built, 'pools': (ip, ints, floats)} for 'sdf' / 'prefiltered'.
+        Scene construction on the GPU backend: 'gpu' (default; MLX/Metal,
+        pydiffvg/scene_gpu.py) or 'cpu' (C++ diffvg.Scene + export_flat).
+        Both produce the same pools; the CPU backend is unaffected.
+    """
+    global _gpu_scene_builder
+    if builder not in ('gpu', 'cpu'):
+        raise ValueError("set_gpu_scene_builder: expected 'gpu' or 'cpu', got %r" % (builder,))
+    _gpu_scene_builder = builder
+
+def get_gpu_scene_builder():
+    return _gpu_scene_builder
+
+def set_scene_refit(enabled):
+    """
+        Enables (default) or disables refitting the BVHs of the previous call
+        when only float parameters change (GPU scene builder); see
+        REFIT_MAX_CALLS / REFIT_MAX_GROWTH in render_mlx.py.
+    """
+    global _scene_refit
+    _scene_refit = bool(enabled)
+    _refit_states.clear()
+
+def get_scene_refit():
+    return _scene_refit
+
+_scene_topology_trust = False
+
+def set_scene_topology_trust(enabled):
+    """
+        UNSAFE opt-in (default False). When True, the GPU scene builder's
+        topology cache trusts int arrays (num_control_points, shape_ids) that
+        are the same Python objects as in a previous call without re-reading
+        their contents (contour: cached lookup ~169 ms -> ~44 ms). Results are
+        WRONG if such an array is modified in place (e.g. `ids[0] = 3`)
+        between renders; assigning a new array is always safe.
+    """
+    global _scene_topology_trust
+    _scene_topology_trust = bool(enabled)
+
+def get_scene_topology_trust():
+    return _scene_topology_trust
+
+class _RefitState:
+    __slots__ = ('pools', 'quality', 'base_quality', 'refits')
+
+_refit_states = weakref.WeakKeyDictionary()   # SceneTopology -> _RefitState
+_grad_gathers = weakref.WeakKeyDictionary()   # SceneTopology -> render_metal.GradGather
+
+def _bvh_quality(pools):
+    """ Lazy float32 (3,): internal / leaf half-perimeter sums of the path, group and scene BVHs. """
+    q = []
+    for b in pools['bvh']:
+        if b is None:
+            q.append(mx.array(0.0))
+            continue
+        nf, ni = b.nodes_f, b.nodes_i
+        hp = (nf[:, 2] - nf[:, 0]) + (nf[:, 3] - nf[:, 1])
+        internal = ni[:, 1] >= 0
+        zero = mx.array(0.0)
+        num = mx.sum(mx.where(internal, hp, zero))
+        den = mx.sum(mx.where(internal, zero, hp))
+        q.append(num / mx.maximum(den, mx.array(1e-20)))
+    return mx.stack(q)
+
+def _refit_source(topology):
+    """ The previous pools to refit from, or None to rebuild (see the policy above). """
+    if not _scene_refit:
+        return None
+    st = _refit_states.get(topology)
+    if st is None or st.pools is None or st.refits >= REFIT_MAX_CALLS:
+        return None
+    if st.base_quality is None:
+        st.base_quality = np.array(st.quality, dtype = np.float64)
+        return st.pools
+    q = np.array(st.quality, dtype = np.float64)
+    if np.any(q > st.base_quality * (1.0 + REFIT_MAX_GROWTH) + 1e-12):
+        return None
+    return st.pools
+
+def _record_pools(topology, pools, refit):
+    if not _scene_refit or pools.get('bvh') is None:
+        return
+    st = _refit_states.get(topology)
+    if st is None or not refit:
+        st = _RefitState()
+        st.refits = 0
+        st.base_quality = None
+        _refit_states[topology] = st
+    else:
+        st.refits += 1
+    # only the BVH builds (build_pools reads refit_from['bvh']); the full dict
+    # references the topology, which would keep the weak key alive
+    st.pools = {'bvh': pools['bvh']}
+    st.quality = _bvh_quality(pools)
+
+def _scene_pools(args, width, height, num_samples_x, num_samples_y, seed, use_prefiltering,
+                 eval_count, has_background):
+    """
+        Flat scene pools for the Metal kernels. Returns a dict:
+        ip (numpy, per-call slots filled), ints / floats (mx.array for the
+        'gpu' builder, numpy for 'cpu'), grads (render_metal.GradGather),
+        builder, and 'scene' (the C++ scene for 'cpu').
+    """
+    from . import render_metal
+    from . import scene_gpu
+    if _gpu_scene_builder == 'gpu':
+        mx.eval([a for a in args if isinstance(a, mx.array)])
+        try:
+            topology = scene_gpu.topology_from_args(args, trust_int_identity = _scene_topology_trust)
+        except ValueError:
+            topology = None   # structure not supported by scene_gpu: C++ scene
+        if topology is not None:
+            refit_from = _refit_source(topology)
+            pools = scene_gpu.build_pools(topology, args, width, height, num_samples_x,
+                                          num_samples_y, seed, use_prefiltering = use_prefiltering,
+                                          eval_count = eval_count, has_background = has_background,
+                                          refit_from = refit_from)
+            _record_pools(topology, pools, refit_from is not None)
+            grads = _grad_gathers.get(topology)
+            if grads is None:
+                grads = _grad_gathers[topology] = render_metal.GradGather(
+                    topology.nargs, topology.grad_pos, topology.grad_start, topology.grad_len)
+            return {'ip': pools['ip_np'], 'ints': pools['ints'], 'floats': pools['floats'],
+                    'grads': grads, 'builder': 'gpu', 'scene': None}
+    from . import render_metal_stage3 as r3
+    from . import metal_scene
+    ip, ints, floats, built = r3.flat_scene(args)
+    grads = render_metal.GradGather(len(args), *render_metal.ranges_from_offsets(
+        metal_scene.primal_offsets(ip, ints, args)))
+    return {'ip': ip, 'ints': ints, 'floats': floats, 'grads': grads, 'builder': 'cpu',
+            'scene': built}
+
+def _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args):
+    """
+        Scene pools plus, for 'color', the prepared kernel inputs and weight
+        image ('flat'); for 'prefiltered', the weight image ('weight').
     """
     from . import render_metal
     from . import render_metal_stage3 as r3
-    if built is None:
-        built = _build_scene(args)
+    ev = _eval_positions_arg(args)
+    use_pref = bool(args[5])
+    prepared = _scene_pools(args, width, height, num_samples_x, num_samples_y, seed, use_pref,
+                            0 if ev is None else int(ev.shape[0]), background_image is not None)
+    ip, ints, floats = prepared['ip'], prepared['ints'], prepared['floats']
     if mode == 'color':
-        built, flat = render_metal.prepare_scene_gpu(args, width, height, num_samples_x,
-                                                     num_samples_y, seed, background_image, built)
-        assert flat is not None
-        return {'scene': built, 'flat': flat}
-    ip, ints, floats, built = r3.flat_scene(args, built)
-    return {'scene': built, 'pools': (ip, ints, floats)}
+        if background_image is not None:
+            _check_background_gpu(background_image, width, height)
+        prepared['flat'] = render_metal.prepare_flat(ip, ints, floats, width, height, num_samples_x,
+                                                     num_samples_y, seed, background_image)
+    elif mode == 'prefiltered':
+        prepared['weight'] = r3.prefiltered_weight_flat(ip, ints, floats, width, height,
+                                                        num_samples_x, num_samples_y, seed)
+    return prepared
+
+def _check_background_gpu(background_image, width, height):
+    if background_image.shape[2] == 3:
+        raise NotImplementedError('Background image must have 4 channels, not 3. Add a fourth channel with all ones via mx.ones().')
+    assert background_image.shape[0] == height and background_image.shape[1] == width
 
 def _forward_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args,
                  scene_cache):
-    """ Metal forward pass; caches the scene and pools in scene_cache for the vjp. """
+    """ Metal forward pass; caches the pools (and weight image) in scene_cache for the vjp. """
     from . import render_metal
     from . import render_metal_stage3 as r3
     prepared = _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
                             background_image, args)
-    scene_cache.update(prepared)
+    scene_cache['gpu'] = prepared
     if mode == 'color':
         return render_metal.render_color_prepared(prepared['flat'])
-    ip, ints, floats = prepared['pools']
+    ip, ints, floats = prepared['ip'], prepared['ints'], prepared['floats']
     if mode == 'sdf':
         return r3.sdf_forward_flat(ip, ints, floats, width, height, num_samples_x, num_samples_y,
                                    seed, _eval_positions_arg(args), bool(args[5]))
     return r3.prefiltered_forward_flat(ip, ints, floats, width, height, num_samples_x,
-                                       num_samples_y, seed, background_image)
+                                       num_samples_y, seed, background_image,
+                                       weight_image = prepared['weight'])
 
 def _backward_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args,
                   grad_img, render_image, scene_cache):
     """
         Metal backward pass. Returns gradients aligned with
-        [background_image] + args (None for non-differentiable entries).
+        [background_image] + args (None for non-differentiable entries;
+        mapped gradients are flat and reshaped by the caller).
         render_image: the forward output (prefiltered filter-radius gradient).
         scene_cache: the forward pass's cache (rebuilt when empty).
     """
     from . import render_metal
     from . import render_metal_stage3 as r3
-    key = 'flat' if mode == 'color' else 'pools'
-    prepared = scene_cache if key in scene_cache else \
-        _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image,
-                     args, scene_cache.get('scene'))
+    prepared = scene_cache.get('gpu')
+    if prepared is None:
+        prepared = _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
+                                background_image, args)
+    ip, ints, floats = prepared['ip'], prepared['ints'], prepared['floats']
     if mode == 'color':
-        flat = prepared['flat']
-        d_floats, d_bg, _ = render_metal.render_backward_prepared(flat, grad_img)
-        ip, ints = flat['ip'], flat['ints']
+        d_floats, d_bg, _ = render_metal.render_backward_prepared(prepared['flat'], grad_img)
+    elif mode == 'sdf':
+        d_floats, _ = r3.sdf_backward_flat(ip, ints, floats, width, height, num_samples_x,
+                                           num_samples_y, seed, grad_img,
+                                           _eval_positions_arg(args), False, bool(args[5]))
+        d_bg = None
     else:
-        ip, ints, floats = prepared['pools']
-        if mode == 'sdf':
-            d_floats, _ = r3.sdf_backward_flat(ip, ints, floats, width, height, num_samples_x,
-                                               num_samples_y, seed, grad_img,
-                                               _eval_positions_arg(args), False, bool(args[5]))
-            d_bg = None
-        else:
-            d_floats, d_bg, _ = r3.prefiltered_backward_flat(
-                ip, ints, floats, width, height, num_samples_x, num_samples_y, seed,
-                background_image, grad_img, render_image = render_image)
-    return [d_bg] + render_metal.grads_from_d_floats({'ip': ip, 'ints': ints}, args, d_floats)
+        d_floats, d_bg, _ = r3.prefiltered_backward_flat(
+            ip, ints, floats, width, height, num_samples_x, num_samples_y, seed,
+            background_image, grad_img, render_image = render_image,
+            weight_image = prepared['weight'])
+    return [d_bg] + prepared['grads'](d_floats)
 
 def _render_grad_gpu(mode, grad_img, width, height, num_samples_x, num_samples_y, seed,
                      background_image, args):
     """ Screen-space translation gradient image (height, width, 2) on Metal. """
     from . import render_metal
     from . import render_metal_stage3 as r3
+    prepared = _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
+                            background_image, args)
+    ip, ints, floats = prepared['ip'], prepared['ints'], prepared['floats']
     if mode == 'color':
-        return render_metal.render_grad_gpu(grad_img, args, width, height, num_samples_x,
-                                            num_samples_y, seed, background_image)
-    ip, ints, floats, _ = r3.flat_scene(args)
-    if mode == 'sdf':
+        _, _, d_tr = render_metal.render_backward_prepared(prepared['flat'], grad_img,
+                                                           want_translation = True)
+    elif mode == 'sdf':
         _, d_tr = r3.sdf_backward_flat(ip, ints, floats, width, height, num_samples_x,
                                        num_samples_y, seed, grad_img, _eval_positions_arg(args),
                                        True, bool(args[5]))
     else:
         _, _, d_tr = r3.prefiltered_backward_flat(ip, ints, floats, width, height, num_samples_x,
                                                   num_samples_y, seed, background_image, grad_img,
-                                                  want_translation = True)
+                                                  want_translation = True,
+                                                  weight_image = prepared['weight'])
     mx.eval(d_tr)
     return d_tr
 
@@ -718,15 +898,22 @@ def render(width,
     array_ids = [i for i, a in enumerate(all_args) if isinstance(a, mx.array)]
 
     def substitute(arrays):
+        # mx.custom_function passes new array objects. Integer arrays
+        # (num_control_points, shape_ids) are structure, not differentiable:
+        # keep the caller's objects so that the GPU builder's topology cache
+        # can recognise them (set_scene_topology_trust). Float arrays must be
+        # the primals (tracers under transformations).
         full = list(all_args)
         for i, a in zip(array_ids, arrays):
-            full[i] = a
+            if not (a.dtype == mx.int32 or a.dtype == mx.int64):
+                full[i] = a
         return full
 
     # The scene built by the forward pass is reused (once) by the backward
     # pass for the same inputs, instead of unpacking the arguments again.
-    # GPU passes also cache the exported pools ('pools' / 'flat') and the
-    # backend decision ('mode') so forward and vjp stay consistent.
+    # GPU passes cache the scene pools, BVH builds, weight image and gradient
+    # map under 'gpu' (see _prepare_gpu), and the backend decision ('mode'),
+    # so forward and vjp stay consistent.
     scene_cache = {}
 
     @mx.custom_function

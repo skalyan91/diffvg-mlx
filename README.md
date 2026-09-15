@@ -121,7 +121,7 @@ Results go to `apps/results/`. Scripts that assemble a video from the iterations
 - `pydiffvg.save_svg` writes a shape group with several subpaths as a single `<path>` element (a compound path), with one `M` command per subpath. Each closed subpath ends with `z`, and the element carries the fill rule of the shape group.
 
 # GPU backend
-The C++ core still builds the scene (bounding volume hierarchies and sampling tables) on the CPU and exports it as flat arrays; Metal kernels, compiled at run time with `mx.fast.metal_kernel`, then do all the per-sample work:
+The scene itself is also built on the GPU: MLX operations pack shapes, colours and transforms into flat arrays and build the bounding volume hierarchies and sampling tables (`pydiffvg/scene_gpu.py`, `pydiffvg/scene_gpu_bvh.py`). The integer structure of the scene (shape types, control-point counts, group membership) is cached between calls, so an optimisation step only repacks the float parameters. Metal kernels, compiled at run time with `mx.fast.metal_kernel`, then do all the per-sample work:
 - colour rendering with area sampling, its gradients (interior and boundary terms) and `RenderFunction.render_grad`;
 - prefiltered colour rendering and its gradients;
 - signed distance output, also at `eval_positions`, and its gradients.
@@ -135,6 +135,16 @@ Timings on an Apple M5 (warm runs, including scene construction in C++; "gradien
 | `tiger.svg` | prefiltered colour | 1 | 1.81 s | 0.036 s | 3.77 s | 0.076 s |
 | `tiger.svg` | signed distance | 1 | 75.4 s | 0.073 s | 146 s | 0.139 s |
 | `hawaii.svg` (3110×2563) | colour | 4 | 71.9 s | 2.39 s | 510 s | 12.3 s |
+
+Building the scene on the GPU matters most for scenes with many shapes: a forward render of `contour.svg` (53,242 shapes) takes 1.91 s instead of 5.72 s with the scene built by the C++ core, and 0.043 s instead of 0.053 s for `tiger.svg`.
+
+Options on the GPU backend:
+- `pydiffvg.set_gpu_scene_builder('cpu')` builds the scene with the C++ core instead (default `'gpu'`); results agree to float rounding.
+- `pydiffvg.set_scene_refit(False)` rebuilds the hierarchies on every call instead of refitting them when only float parameters change (default on; refitting is always correct but currently saves little time).
+- `pydiffvg.set_scene_topology_trust(True)` skips re-reading integer arrays (control-point counts, shape ids) that are the same objects as in the previous call. It is faster for very large scenes but **unsafe if you modify those arrays in place**, so it is off by default. Float parameters are always re-read, so in-place updates of points, colours and transforms are safe.
+- Shape groups with no shapes are supported by the GPU scene builder; the C++ core (CPU backend or `'cpu'` builder) raises an error for them.
+
+With tens of thousands of separate parameter arrays, `mx.value_and_grad` itself becomes the bottleneck: tracing gradients for all 213,000 arrays of `contour.svg` takes most of the 97 s of a gradient step, while rendering takes under 2 s. Keep parameters in a few large arrays and slice them when building shapes.
 
 Colour output at `eval_positions` is not supported by either backend. The GPU uses the same random sample positions as the CPU, so forward renders agree up to float32 rounding: pixels whose sample lies within about 1e-6 px of an edge can switch coverage. Gradients agree with the CPU within Monte Carlo noise and with finite differences.
 

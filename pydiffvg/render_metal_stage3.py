@@ -4,9 +4,10 @@
     (forward + backward), and the screen-space translation gradient image.
 
     Shared Metal code: pydiffvg/metal/{common, geometry, color, backward,
-    distance_grad, prefilter}.metal. The scene is built by the C++ core
-    (render_mlx._build_scene) and flattened with export_flat, as in
-    render_metal.py.
+    distance_grad, prefilter}.metal. The *_flat functions take pools from
+    scene_gpu.build_pools (mx arrays) or export_flat (numpy), as in
+    render_metal.py; the scene-argument level helpers (flat_scene, *_gpu)
+    build the scene with the C++ core.
 
     Gradients come back as `d_floats`, a pool with the layout of `floats`
     (map to the serialized arguments with metal_scene.primal_offsets).
@@ -280,9 +281,8 @@ def _fill_ip(ip, width, height, nsx, nsy, seed, use_prefiltering, has_background
 
 
 def _pools(ints, floats):
-    ints_m = rm._pad(mx.array(np.asarray(ints, dtype = np.int32)))
-    floats_m = rm._pad(mx.array(np.asarray(floats, dtype = np.float32)))
-    return ints_m, floats_m
+    """ numpy pools are uploaded; mx pools (scene_gpu.build_pools) are used as they are """
+    return rm._pool_m(ints, mx.int32), rm._pool_m(floats, mx.float32)
 
 
 def _opts(want_translation = False, exact_scan = False):
@@ -364,14 +364,29 @@ def _weight_image(ip_m, ints_m, floats_m, n, width, height):
         init_value = 0)[0]
 
 
+def prefiltered_weight_flat(ip, ints, floats, width, height, nsx, nsy, seed):
+    """
+        The (lazy) weight image of a prefiltered render, float32[max(W*H, 8)];
+        pass it as weight_image= to prefiltered_forward_flat and
+        prefiltered_backward_flat to share it between the passes.
+    """
+    n = width * height * nsx * nsy
+    if n == 0:
+        return None
+    ip_m = _fill_ip(ip, width, height, nsx, nsy, seed, True, False, 0)
+    ints_m, floats_m = _pools(ints, floats)
+    return _weight_image(ip_m, ints_m, floats_m, n, width, height)
+
+
 def prefiltered_forward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
-                             background_image = None, exact_scan = False):
+                             background_image = None, exact_scan = False, weight_image = None):
     ip_m = _fill_ip(ip, width, height, nsx, nsy, seed, True, background_image is not None, 0)
     ints_m, floats_m = _pools(ints, floats)
     n = width * height * nsx * nsy
     if n == 0:
         return mx.zeros((height, width, 4), dtype = mx.float32)
-    weight = _weight_image(ip_m, ints_m, floats_m, n, width, height)
+    weight = weight_image if weight_image is not None else \
+        _weight_image(ip_m, ints_m, floats_m, n, width, height)
     out = _kernel('prefilter_forward')(
         inputs = [ip_m, ints_m, floats_m, weight, _background_m(background_image, width, height),
                   _opts(exact_scan = exact_scan)],
@@ -383,11 +398,11 @@ def prefiltered_forward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
 
 def prefiltered_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
                               background_image, d_render_image, want_translation = False,
-                              exact_scan = False, render_image = None):
+                              exact_scan = False, render_image = None, weight_image = None):
     """
         Returns (d_floats, d_background (H, W, 4) or None, d_translation (H, W, 2) or None).
         render_image: the forward output (H, W, 4) for the filter-radius gradient;
-        recomputed when None.
+        recomputed when None. weight_image: see prefiltered_weight_flat.
     """
     has_bg = background_image is not None
     ip_m = _fill_ip(ip, width, height, nsx, nsy, seed, True, has_bg, 0)
@@ -398,7 +413,8 @@ def prefiltered_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
     if n == 0:
         return (mx.zeros((nf,)), mx.zeros((height, width, 4)) if has_bg else None,
                 mx.zeros((height, width, 2)) if want_translation else None)
-    weight = _weight_image(ip_m, ints_m, floats_m, n, width, height)
+    weight = weight_image if weight_image is not None else \
+        _weight_image(ip_m, ints_m, floats_m, n, width, height)
     d_img = rm._pad(_as_mx(d_render_image))
     if render_image is None:
         render_image = _kernel('prefilter_forward')(

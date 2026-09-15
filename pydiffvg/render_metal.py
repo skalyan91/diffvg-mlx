@@ -1,17 +1,17 @@
 """
     Metal (Apple GPU) backend for diffvg.
 
-    The scene is built by the C++ core exactly as on the CPU path (BVHs,
-    CDFs), flattened with diffvg.Scene.export_flat(), and rasterised by
-    mx.fast.metal_kernel kernels whose shared code lives in pydiffvg/metal/
-    (common.metal, geometry.metal, color.metal, backward.metal; see the
-    layout in common.metal).
+    The flat scene pools (layout in pydiffvg/metal/common.metal) come either
+    from pydiffvg/scene_gpu.py (MLX arrays built on the GPU; the default) or
+    from the C++ core's diffvg.Scene.export_flat() (numpy); every function
+    taking pools accepts both (see render_mlx._scene_pools). They are
+    rasterised by mx.fast.metal_kernel kernels whose shared code lives in
+    pydiffvg/metal/ (common.metal, geometry.metal, color.metal, backward.metal).
 
     Kernels: weight, render_color (forward); render_color_backward,
     sample_boundary, render_edge (backward: interior colour gradients, filter
     radius, background, boundary/edge-sampling gradients, translation image).
-    Signed distance output, prefiltering and eval_positions fall back to the
-    CPU core (render_mlx._forward / _backward).
+    Signed distance output and prefiltering: render_metal_stage3.py.
 """
 import os
 import numpy as np
@@ -254,10 +254,18 @@ _RENDER_COLOR_BACKWARD_SOURCE = """
 _SAMPLE_BOUNDARY_SOURCE = """
     uint idx = thread_position_in_grid.x;
     SceneView s = make_scene_view(floats, ints, ip);
-    BoundarySample b;
-    bool ok = generate_boundary_sample(s, int(idx), b);
     int fo = BS_F_STRIDE * int(idx);
     int io = BS_I_STRIDE * int(idx);
+    // Edge sampling needs a non-empty scene with non-zero total boundary
+    // length (the normalised sample CDF ends in 1, else it is all zeros).
+    // Checked here so that the host never has to read the pools.
+    int nts = ip[IP_NUM_TOTAL_SHAPES];
+    if (ip[IP_NUM_GROUPS] <= 0 || nts <= 0 || !(floats[ip[IP_SAMPLE_CDF_OFF] + nts - 1] > 0.0f)) {
+        atomic_store_explicit(&bs_i[io + 1], -1, memory_order_relaxed);
+        return;
+    }
+    BoundarySample b;
+    bool ok = generate_boundary_sample(s, int(idx), b);
     if (!ok) {
         atomic_store_explicit(&bs_i[io + 1], -1, memory_order_relaxed);
         return;
@@ -482,14 +490,23 @@ def is_supported(output_type, use_prefiltering, eval_positions):
     return True
 
 
+def _pool_m(a, dtype):
+    """ Kernel-ready pool: mx arrays are used as they are (no host round trip). """
+    if isinstance(a, mx.array):
+        return _pad(a if a.dtype == dtype else a.astype(dtype))
+    return _pad(mx.array(np.asarray(a, dtype = np.float32 if dtype == mx.float32 else np.int32)))
+
+
 def prepare_flat(ip, ints, floats, width, height, num_samples_x, num_samples_y,
                  seed, background_image = None):
     """
-        Uploads flattened pools (numpy arrays from export_flat) and fills the
-        per-render ip slots; computes the (lazy) weight image. Returns a dict
-        reused by the forward colour pass and by the backward kernels:
-        ip (numpy), ints (numpy), ip_m, ints_m, floats_m, bg_m, weight_image,
-        width, height, num_samples, has_background.
+        Prepares flattened pools for the kernels and fills the per-render ip
+        slots; computes the (lazy) weight image. ip: host int32 array. ints /
+        floats: numpy arrays (export_flat; uploaded here) or mx arrays
+        (scene_gpu.build_pools; used as they are). Returns a dict reused by
+        the forward colour pass and by the backward kernels:
+        ip (numpy), ip_m, ints_m, floats_m, bg_m, weight_image, width, height,
+        num_samples, has_background, has_edges.
     """
     ip = np.array(ip, dtype = np.int32, copy = True)
     ip[ms.IP_W] = width
@@ -503,9 +520,8 @@ def prepare_flat(ip, ints, floats, width, height, num_samples_x, num_samples_y,
     ip[ms.IP_USE_EVAL_POSITIONS] = 0
     ip[IP_WANT_D_TRANSLATION] = 0
 
-    ints = np.asarray(ints, dtype = np.int32)
-    ints_m = _pad(mx.array(ints))
-    floats_m = _pad(mx.array(np.asarray(floats, dtype = np.float32)))
+    ints_m = _pool_m(ints, mx.int32)
+    floats_m = _pool_m(floats, mx.float32)
     if background_image is not None:
         bg = background_image
         if not isinstance(bg, mx.array):
@@ -517,11 +533,14 @@ def prepare_flat(ip, ints, floats, width, height, num_samples_x, num_samples_y,
 
     num_pixels = width * height
     num_samples = num_pixels * num_samples_x * num_samples_y
-    # Edge sampling needs a non-empty scene with non-zero total boundary length
-    floats_np = np.asarray(floats, dtype = np.float32)
+    # Edge sampling needs a non-empty scene with non-zero total boundary length.
+    # The structural part is decided here; zero total length is detected by
+    # the sample_boundary kernel itself (no pool read-back).
     num_total_shapes = int(ip[ms.IP_NUM_TOTAL_SHAPES])
-    has_edges = int(ip[ms.IP_NUM_GROUPS]) > 0 and num_total_shapes > 0 and \
-        float(floats_np[int(ip[ms.IP_SAMPLE_CDF_OFF]) + num_total_shapes - 1]) > 0
+    has_edges = int(ip[ms.IP_NUM_GROUPS]) > 0 and num_total_shapes > 0
+    if has_edges and not isinstance(floats, mx.array):
+        floats_np = np.asarray(floats, dtype = np.float32)
+        has_edges = float(floats_np[int(ip[ms.IP_SAMPLE_CDF_OFF]) + num_total_shapes - 1]) > 0
     flat = dict(ip = ip, ints = ints, has_edges = has_edges, ip_m = _pad(mx.array(ip)), ints_m = ints_m,
                 floats_m = floats_m, bg_m = bg_m, width = width, height = height,
                 num_samples = num_samples, has_background = background_image is not None,
@@ -718,24 +737,66 @@ def render_forward_gpu(scene_args, width, height, num_samples_x, num_samples_y, 
     return render_color_prepared(flat)
 
 
+class GradGather:
+    """
+        Maps a d_floats pool to per-argument gradients with one gather and one
+        split. Built once per scene structure from contiguous pool ranges
+        (arg position, pool start, count), e.g. scene_gpu's topology.grad_pos /
+        grad_start / grad_len or ranges_from_offsets(metal_scene.primal_offsets).
+    """
+    __slots__ = ('nargs', 'pos', 'index_m', 'split')
+
+    def __init__(self, nargs, pos, start, count):
+        pos = np.asarray(pos, np.int64).reshape(-1)
+        start = np.asarray(start, np.int64).reshape(-1)
+        count = np.asarray(count, np.int64).reshape(-1)
+        order = np.argsort(pos, kind = 'stable')
+        pos, start, count = pos[order], start[order], count[order]
+        self.nargs = nargs
+        self.pos = pos.tolist()
+        total = int(count.sum())
+        ends = np.cumsum(count)
+        index = np.repeat(start - ends + count, count) + np.arange(total, dtype = np.int64) \
+            if total > 0 else np.zeros(0, np.int64)
+        self.index_m = mx.array(index.astype(np.int32)) if total > 0 else None
+        self.split = ends[:-1].tolist()
+
+    def __call__(self, d_floats):
+        """ Flat (1-D) gradients aligned with the args, None where unmapped. """
+        out = [None] * self.nargs
+        if not self.pos:
+            return out
+        if self.index_m is None:
+            parts = [mx.zeros((0,), dtype = mx.float32)] * len(self.pos)
+        else:
+            g = d_floats[self.index_m]
+            parts = mx.split(g, self.split) if len(self.pos) > 1 else [g]
+        for p, d in zip(self.pos, parts):
+            out[p] = d
+        return out
+
+
+def ranges_from_offsets(offsets):
+    """ metal_scene.primal_offsets list -> (pos, start, count) arrays. """
+    pos, start, count = [], [], []
+    for k, idx in enumerate(offsets):
+        if idx is None:
+            continue
+        pos.append(k)
+        start.append(int(idx[0]) if idx.size else 0)
+        count.append(int(idx.size))
+    return pos, start, count
+
+
 def grads_from_d_floats(flat, scene_args, d_floats):
     """
         Splits a d_floats pool into per-argument gradients aligned with
         scene_args (None where the argument has no pool storage).
+        flat: a dict with export_flat's 'ip' and 'ints' (numpy).
     """
     offs = ms.primal_offsets(flat['ip'], flat['ints'], scene_args)
-    out = [None] * len(scene_args)
-    for k, idx in enumerate(offs):
-        if idx is None or idx.size == 0:
-            continue
-        a = scene_args[k]
-        o0 = int(idx[0])
-        if int(idx[-1]) - o0 == idx.size - 1:
-            d = d_floats[o0:o0 + idx.size]
-        else:
-            d = mx.take(d_floats, mx.array(idx.astype(np.int32)))
-        out[k] = d.reshape(a.shape)
-    return out
+    grads = GradGather(len(scene_args), *ranges_from_offsets(offs))(d_floats)
+    return [None if d is None else d.reshape(scene_args[k].shape) for k, d in enumerate(grads)]
 
 
 def render_grad_gpu(grad_img, scene_args, width, height, num_samples_x, num_samples_y, seed,
