@@ -1,6 +1,7 @@
 #pragma once
 
 #include "diffvg.h"
+#include "compute_distance.h"
 #include "edge_query.h"
 #include "shape.h"
 #include "vector.h"
@@ -13,6 +14,24 @@ bool within_distance(const Circle &circle, const Vector2f &pt, float r) {
         return true;
     }
     return false;
+}
+
+DEVICE
+inline
+bool within_distance(const Ellipse &ellipse, const Vector2f &pt, float r) {
+    // Cheap rejection/acceptance using the axis-aligned annulus bounds:
+    // the boundary lies between the radii min(|rx|,|ry|) and max(|rx|,|ry|).
+    auto d_center = distance(ellipse.center, pt);
+    auto r_min = min(fabs(ellipse.radius.x), fabs(ellipse.radius.y));
+    auto r_max = max(fabs(ellipse.radius.x), fabs(ellipse.radius.y));
+    if (d_center >= r_max + r || d_center <= r_min - r) {
+        return false;
+    }
+    auto closest_pt = Vector2f{0, 0};
+    if (!closest_point(ellipse, pt, &closest_pt)) {
+        return false;
+    }
+    return distance_squared(closest_pt, pt) < r * r;
 }
 
 DEVICE
@@ -340,9 +359,7 @@ bool within_distance(const Shape &shape, const BVHNode *bvh_nodes, const Vector2
         case ShapeType::Circle:
             return within_distance(*(const Circle *)shape.ptr, pt, r);
         case ShapeType::Ellipse:
-            // https://www.geometrictools.com/Documentation/DistancePointEllipseEllipsoid.pdf
-            assert(false);
-            return false;
+            return within_distance(*(const Ellipse *)shape.ptr, pt, r);
         case ShapeType::Path:
             return within_distance(*(const Path *)shape.ptr, bvh_nodes, pt, r);
         case ShapeType::Rect:

@@ -87,19 +87,30 @@ bool is_inside(const SceneData &scene_data,
 }
 
 DEVICE void accumulate_boundary_gradient(const Shape &shape,
-                                         float contrib,
+                                         float canvas_contrib,
                                          float t,
-                                         const Vector2f &normal,
+                                         const Vector2f &normal, // shape (local) space
                                          const BoundaryData &boundary_data,
                                          Shape &d_shape,
                                          const Matrix3x3f &shape_to_canvas,
                                          const Vector2f &local_boundary_pt,
-                                         Matrix3x3f &d_shape_to_canvas) {
-    assert(isfinite(contrib));
+                                         Matrix3x3f &d_shape_to_canvas,
+                                         const Vector2f &canvas_normal,
+                                         float local_velocity_scale) {
+    assert(isfinite(canvas_contrib));
     assert(isfinite(normal));
+    assert(isfinite(canvas_normal));
     // According to Reynold transport theorem,
     // the Jacobian of the boundary integral is dot(velocity, normal),
     // where the velocity depends on the variable being differentiated with.
+    // canvas_contrib is the Monte Carlo weight of the canvas-space boundary
+    // integral, so it must be multiplied by dot(canvas velocity, canvas normal).
+    // Shape parameters move the boundary in local space; with
+    // M = linear part of shape_to_canvas and
+    // canvas_normal = normalize(M^{-T} normal):
+    //   dot(M v_local, canvas_normal) = dot(v_local, normal) / |M^{-T} normal|
+    // so we use the local normal with contrib scaled by local_velocity_scale.
+    auto contrib = canvas_contrib * local_velocity_scale;
     if (boundary_data.is_stroke) {
         auto has_path_thickness = false;
         if (shape.type == ShapeType::Path) {
@@ -149,10 +160,17 @@ DEVICE void accumulate_boundary_gradient(const Shape &shape,
     switch (shape.type) {
         case ShapeType::Circle: {
             Circle *d_p = (Circle*)d_shape.ptr;
+            const Circle &circle = *(const Circle *)shape.ptr;
             // velocity for the center is (1, 0) for x and (0, 1) for y
             atomic_add(&d_p->center[0], normal * contrib);
-            // velocity for the radius is the same as the normal
-            atomic_add(&d_p->radius, contrib);
+            // velocity for the radius is the radial direction. This equals the
+            // normal only on an outward-facing boundary: on the inner side of a
+            // stroke (or after the normal is flipped) it is minus the normal.
+            auto radial = local_boundary_pt - circle.center;
+            auto radial_len = length(radial);
+            if (radial_len > 0) {
+                atomic_add(&d_p->radius, dot(radial / radial_len, normal) * contrib);
+            }
             break;
         } case ShapeType::Ellipse: {
             Ellipse *d_p = (Ellipse*)d_shape.ptr;
@@ -163,8 +181,11 @@ DEVICE void accumulate_boundary_gradient(const Shape &shape,
             // y = center.y + r.y * sin(2pi * t)
             // for r.x: (cos(2pi * t), 0)
             // for r.y: (0, sin(2pi * t))
-            atomic_add(&d_p->radius.x, cos(2 * float(M_PI) * t) * normal.x * contrib);
-            atomic_add(&d_p->radius.y, sin(2 * float(M_PI) * t) * normal.y * contrib);
+            // use the (possibly remapped) parameter stored by sample_boundary,
+            // not the raw random number
+            auto te = boundary_data.path.t;
+            atomic_add(&d_p->radius.x, cos(2 * float(M_PI) * te) * normal.x * contrib);
+            atomic_add(&d_p->radius.y, sin(2 * float(M_PI) * te) * normal.y * contrib);
             break;
         } case ShapeType::Path: {
             Path *d_p = (Path*)d_shape.ptr;
@@ -231,26 +252,30 @@ DEVICE void accumulate_boundary_gradient(const Shape &shape,
             break;
         } case ShapeType::Rect: {
             Rect *d_p = (Rect*)d_shape.ptr;
-            // The velocity depends on the position of the boundary
-            if (normal == Vector2f{-1, 0}) {
-                // left
-                // velocity for p_min is (1, 0) for x and (0, 0) for y
-                atomic_add(&d_p->p_min.x, -contrib);
-            } else if (normal == Vector2f{1, 0}) {
-                // right
-                // velocity for p_max is (1, 0) for x and (0, 0) for y
-                atomic_add(&d_p->p_max.x, contrib);
-            } else if (normal == Vector2f{0, -1}) {
-                // top
-                // velocity for p_min is (0, 0) for x and (0, 1) for y
-                atomic_add(&d_p->p_min.y, -contrib);
-            } else if (normal == Vector2f{0, 1}) {
-                // bottom
-                // velocity for p_max is (0, 0) for x and (0, 1) for y
-                atomic_add(&d_p->p_max.y, contrib);
+            const Rect &rect = *(const Rect *)shape.ptr;
+            // The velocity depends on which edge the sample lies on. Identify
+            // the edge from the sample position rather than from the normal:
+            // the normal is flipped on the inner side of a stroke (and whenever
+            // render_edge_kernel swaps inside/outside), which previously
+            // attributed the gradient to the opposite edge.
+            // The x and y components are handled separately so that samples on
+            // the rounded stroke corners (normal not axis aligned) move with
+            // both coordinates of their corner. For points on an edge the
+            // normal has a single non-zero component.
+            auto center = 0.5f * (rect.p_min + rect.p_max);
+            if (local_boundary_pt.x < center.x) {
+                // left edge / left corners: velocity for p_min.x is (1, 0)
+                atomic_add(&d_p->p_min.x, normal.x * contrib);
             } else {
-                // incorrect normal assignment?
-                assert(false);
+                // right edge / right corners: velocity for p_max.x is (1, 0)
+                atomic_add(&d_p->p_max.x, normal.x * contrib);
+            }
+            if (local_boundary_pt.y < center.y) {
+                // top edge / top corners: velocity for p_min.y is (0, 1)
+                atomic_add(&d_p->p_min.y, normal.y * contrib);
+            } else {
+                // bottom edge / bottom corners: velocity for p_max.y is (0, 1)
+                atomic_add(&d_p->p_max.y, normal.y * contrib);
             }
             break;
         } default: {
@@ -267,7 +292,7 @@ DEVICE void accumulate_boundary_gradient(const Shape &shape,
     auto d_local_boundary_pt = Vector2f{0, 0};
     d_xform_pt(shape_to_canvas,
                local_boundary_pt,
-               normal * contrib,
+               canvas_normal * canvas_contrib,
                d_shape_to_canvas_,
                d_local_boundary_pt);
     atomic_add(&d_shape_to_canvas(0, 0), d_shape_to_canvas_);
@@ -493,6 +518,10 @@ void d_sample_color(const ColorType &color_type,
                     if (d_translation != nullptr) {
                         atomic_add(d_translation, d_center);
                     }
+                    // Without this return the gradient also fell through to
+                    // the "beyond the last stop" case below and was added a
+                    // second time to the last stop colour.
+                    return;
                 }
             }
             atomic_add(&d_c->stop_colors[4 * (c->num_stops - 1)], d_color);
@@ -755,7 +784,8 @@ float sample_distance(const SceneData &scene,
     }
     assert((min_group_id >= 0 && min_shape_id >= 0) || scene.num_shape_groups == 0);
     if (d_dist != nullptr) {
-        auto d_abs_dist = inside ? -(*d_dist) : (*d_dist);
+        // forward: returned distance = weight * (+-distance)
+        auto d_abs_dist = weight * (inside ? -(*d_dist) : (*d_dist));
         const ShapeGroup &shape_group = scene.shape_groups[min_group_id];
         const Shape &shape = scene.shapes[min_shape_id];
         ShapeGroup &d_shape_group = scene.d_shape_groups[min_group_id];
@@ -798,6 +828,17 @@ Vector4f gather_d_color(const Filter &filter,
                 auto yc = yy + 0.5f;
                 auto filter_weight =
                     compute_filter_weight(filter, xc - pt.x, yc - pt.y);
+                // A point exactly on the border of a pixel footprint belongs to
+                // both neighbouring pixels (the filter support is closed). For
+                // point samples this is a measure-zero event, but boundary
+                // samples of pixel-aligned edges (e.g. integer rectangles) hit
+                // it systematically and were counted twice. Split the weight.
+                if (fabs(xc - pt.x) == radius) {
+                    filter_weight *= 0.5f;
+                }
+                if (fabs(yc - pt.y) == radius) {
+                    filter_weight *= 0.5f;
+                }
                 // pixel = \sum weight * color / \sum weight
                 auto weight_sum = weight_image[yy * width + xx];
                 if (weight_sum > 0) {
@@ -1314,7 +1355,11 @@ struct render_kernel {
 struct BoundarySample {
     Vector2f pt;
     Vector2f local_pt;
-    Vector2f normal;
+    Vector2f normal; // canvas space
+    Vector2f local_normal; // shape space
+    // Scale that maps (local velocity . local normal) to
+    // (canvas velocity . canvas normal): 1 / |canvas_to_shape^T local_normal|
+    float local_velocity_scale;
     int shape_group_id;
     int shape_id;
     float t;
@@ -1360,7 +1405,28 @@ struct sample_boundary_kernel {
         // local_boundary_pt & normal are in shape's local space,
         // transform them to canvas space
         auto boundary_pt = xform_pt(shape_group.shape_to_canvas, local_boundary_pt);
-        normal = xform_normal(shape_group.canvas_to_shape, normal);
+        auto local_normal = normal;
+        // The boundary pdf above is with respect to the *local* arc length,
+        // but the boundary integral (Reynolds transport) is over the canvas
+        // boundary. Convert the pdf to canvas arc length using the Jacobian
+        // |d(canvas pt)/d(local pt) * local tangent|.
+        const auto &m = shape_group.shape_to_canvas;
+        auto local_tangent = Vector2f{-local_normal.y, local_normal.x};
+        auto canvas_tangent = Vector2f{
+            m(0, 0) * local_tangent.x + m(0, 1) * local_tangent.y,
+            m(1, 0) * local_tangent.x + m(1, 1) * local_tangent.y};
+        const auto &mi = shape_group.canvas_to_shape;
+        // unnormalized canvas normal = canvas_to_shape^T * local_normal
+        auto canvas_normal_unnormalized = Vector2f{
+            mi(0, 0) * local_normal.x + mi(1, 0) * local_normal.y,
+            mi(0, 1) * local_normal.x + mi(1, 1) * local_normal.y};
+        auto arc_length_jacobian = length(canvas_tangent);
+        auto canvas_normal_length = length(canvas_normal_unnormalized);
+        if (!(arc_length_jacobian > 0) || !(canvas_normal_length > 0)) {
+            return;
+        }
+        boundary_pdf /= arc_length_jacobian;
+        normal = canvas_normal_unnormalized / canvas_normal_length;
         // Normalize boundary_pt to [0, 1)
         boundary_pt.x /= scene.canvas_width;
         boundary_pt.y /= scene.canvas_height;
@@ -1368,6 +1434,8 @@ struct sample_boundary_kernel {
         boundary_samples[idx].pt = boundary_pt;
         boundary_samples[idx].local_pt = local_boundary_pt;
         boundary_samples[idx].normal = normal;
+        boundary_samples[idx].local_normal = local_normal;
+        boundary_samples[idx].local_velocity_scale = 1 / canvas_normal_length;
         boundary_samples[idx].shape_group_id = shape_group_id;
         boundary_samples[idx].shape_id = shape_id;
         boundary_samples[idx].t = t;
@@ -1394,6 +1462,8 @@ struct render_edge_kernel {
         auto boundary_pt = boundary_samples[bid].pt;
         auto local_boundary_pt = boundary_samples[bid].local_pt;
         auto normal = boundary_samples[bid].normal;
+        auto local_normal = boundary_samples[bid].local_normal;
+        auto local_velocity_scale = boundary_samples[bid].local_velocity_scale;
         auto shape_group_id = boundary_samples[bid].shape_group_id;
         auto shape_id = boundary_samples[bid].shape_id;
         auto t = boundary_samples[bid].t;
@@ -1425,6 +1495,7 @@ struct render_edge_kernel {
         }
         if (!inside_query.hit) {
             normal = -normal;
+            local_normal = -local_normal;
             swap_(inside_query, outside_query);
             swap_(color_inside, color_outside);
         }
@@ -1446,8 +1517,9 @@ struct render_edge_kernel {
         auto contrib = dot(color_inside - color_outside, d_color) / pdf;
         ShapeGroup &d_shape_group = scene.d_shape_groups[shape_group_id];
         accumulate_boundary_gradient(scene.shapes[shape_id],
-            contrib, t, normal, boundary_data, scene.d_shapes[shape_id],
-            shape_group.shape_to_canvas, local_boundary_pt, d_shape_group.shape_to_canvas);
+            contrib, t, local_normal, boundary_data, scene.d_shapes[shape_id],
+            shape_group.shape_to_canvas, local_boundary_pt, d_shape_group.shape_to_canvas,
+            normal, local_velocity_scale);
         // Don't need to backprop to filter weights:
         // \int f'(x) g(x) dx doesn't contain discontinuities
         // if f is continuous, even if g is discontinuous
@@ -1757,7 +1829,7 @@ PYBIND11_MODULE(diffvg, m) {
         .def("fill_color_as_radial_gradient", &ShapeGroup::fill_color_as_radial_gradient)
         .def("stroke_color_as_constant", &ShapeGroup::stroke_color_as_constant)
         .def("stroke_color_as_linear_gradient", &ShapeGroup::stroke_color_as_linear_gradient)
-        .def("stroke_color_as_radial_gradient", &ShapeGroup::fill_color_as_radial_gradient)
+        .def("stroke_color_as_radial_gradient", &ShapeGroup::stroke_color_as_radial_gradient)
         .def("has_fill_color", &ShapeGroup::has_fill_color)
         .def("has_stroke_color", &ShapeGroup::has_stroke_color)
         .def("copy_to", &ShapeGroup::copy_to)

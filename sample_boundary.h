@@ -17,6 +17,21 @@ struct BoundaryData {
     bool is_stroke;
 };
 
+// Speed |d/dt (c(t) + dir * r(t) * n(t))| of a stroke offset curve, where
+// d1 = c'(t), d2 = c''(t), n = perp(c') / |c'|, r = stroke radius, dr = r'(t).
+// Stroke boundaries are offset curves whose arc length differs from the
+// center curve by (1 + dir * r * curvature), so the sampling pdf
+// (per unit length of the sampled boundary) must use this speed instead of |c'|.
+DEVICE
+inline
+float offset_curve_speed(const Vector2f &d1, const Vector2f &d2,
+                         float r, float dr, float dir) {
+    auto len = length(d1);
+    auto n = Vector2f{-d1.y, d1.x} / len;
+    auto dn = Vector2f{-d2.y, d2.x} / len - n * (dot(d1, d2) / (len * len));
+    return length(d1 + dir * (dr * n + r * dn));
+}
+
 DEVICE
 Vector2f sample_boundary(const Circle &circle,
                          float t,
@@ -33,7 +48,13 @@ Vector2f sample_boundary(const Circle &circle,
         circle.radius * sin(2 * float(M_PI) * t)
     };
     normal = normalize(offset);
-    pdf /= (2 * float(M_PI) * circle.radius);
+    // The stroke boundary is a circle of radius (radius +- stroke_radius)
+    auto boundary_radius = fabs(circle.radius + stroke_perturb_direction * stroke_radius);
+    if (boundary_radius <= 0) {
+        pdf = 0;
+        return Vector2f{0, 0};
+    }
+    pdf /= (2 * float(M_PI) * boundary_radius);
     auto ret = circle.center + offset;
     if (stroke_perturb_direction != 0.f) {
         ret += stroke_perturb_direction * stroke_radius * normal;
@@ -50,9 +71,12 @@ Vector2f sample_boundary(const Ellipse &ellipse,
                          float t,
                          Vector2f &normal,
                          float &pdf,
-                         BoundaryData &,
+                         BoundaryData &data,
                          float stroke_perturb_direction,
                          float stroke_radius) {
+    // t may have been remapped by the fill/stroke selection; record the
+    // parameter actually used so that the radius derivative uses it.
+    data.path.t = t;
     // Parametric form of a ellipse (t in [0, 1)):
     // x = center.x + r.x * cos(2pi * t)
     // y = center.y + r.y * sin(2pi * t)
@@ -65,7 +89,22 @@ Vector2f sample_boundary(const Ellipse &ellipse,
     auto dydt = r.y * cos(2 * float(M_PI) * t) * 2 * float(M_PI);
     // tangent is normalize(dxdt, dydt)
     normal = normalize(Vector2f{dydt, -dxdt});
-    pdf /= sqrt(square(dxdt) + square(dydt));
+    if (stroke_perturb_direction != 0.f) {
+        auto two_pi_sq = square(2 * float(M_PI));
+        auto d2 = Vector2f{-r.x * cos(2 * float(M_PI) * t) * two_pi_sq,
+                           -r.y * sin(2 * float(M_PI) * t) * two_pi_sq};
+        // offset_curve_speed uses n = perp(c') = (-c'.y, c'.x)/|c'|, while the
+        // ellipse normal is (c'.y, -c'.x)/|c'|: flip the direction accordingly.
+        auto speed = offset_curve_speed(Vector2f{dxdt, dydt}, d2,
+                                        stroke_radius, 0.f, -stroke_perturb_direction);
+        if (!(speed > 0)) {
+            pdf = 0;
+            return Vector2f{0, 0};
+        }
+        pdf /= speed;
+    } else {
+        pdf /= sqrt(square(dxdt) + square(dydt));
+    }
     auto ret = ellipse.center + offset;
     if (stroke_perturb_direction != 0.f) {
         ret += stroke_perturb_direction * stroke_radius * normal;
@@ -89,60 +128,59 @@ Vector2f sample_boundary(const Path &path,
                          BoundaryData &data,
                          float stroke_perturb_direction,
                          float stroke_radius) {
-    if (stroke_perturb_direction != 0.f && !path.is_closed) {
-        // We need to samples the "caps" of the path
-        // length of a cap is pi * abs(stroke_perturb_direction)
-        // there are two caps
+    if (stroke_perturb_direction != 0.f) {
+        // A stroke is the union of round-capped segments (see within_distance),
+        // so besides the offset curves its boundary contains circular arcs
+        // around the path vertices: the end caps of open paths *and* the round
+        // joins between consecutive segments (for open and closed paths).
+        // We sample full circles around every vertex; the parts of a circle
+        // that lie inside the stroke contribute nothing, since the colours on
+        // both sides are equal.
+        auto num_circles = path.is_closed ? path.num_base_points : path.num_base_points + 1;
+        auto vertex_point_id = [&](int k) -> int {
+            return k < path.num_base_points ? point_id_map[k] : path.num_points - 1;
+        };
         auto cap_length = 0.f;
         if (path.thickness != nullptr) {
-            auto r0 = path.thickness[0];
-            auto r1 = path.thickness[path.num_points - 1];
-            cap_length = float(M_PI) * (r0 + r1);
+            for (int k = 0; k < num_circles; k++) {
+                cap_length += 2 * float(M_PI) * path.thickness[vertex_point_id(k)];
+            }
         } else {
-            cap_length = 2 * float(M_PI) * stroke_radius;
+            cap_length = 2 * float(M_PI) * stroke_radius * num_circles;
         }
         auto cap_prob = cap_length / (cap_length + path_length);
         if (t < cap_prob) {
             t = t / cap_prob;
-            pdf *= cap_prob;
-            auto r0 = stroke_radius;
-            auto r1 = stroke_radius;
-            if (path.thickness != nullptr) {
-                r0 = path.thickness[0];
-                r1 = path.thickness[path.num_points - 1];
+            // pick a vertex uniformly, then an angle uniformly
+            auto k = min(int(t * num_circles), num_circles - 1);
+            t = t * num_circles - k;
+            auto pid = vertex_point_id(k);
+            auto r = path.thickness != nullptr ? path.thickness[pid] : stroke_radius;
+            if (!(r > 0)) {
+                pdf = 0;
+                return Vector2f{0, 0};
             }
-            // HACK: in theory we want to compute the tangent and
-            //       sample the hemi-circle, but here we just sample the
-            //       full circle since it's less typing
-            if (stroke_perturb_direction < 0) {
-                // Sample the cap at the beginning
-                auto p0 = Vector2f{path.points[0], path.points[1]};
-                auto offset = Vector2f{
-                    r0 * cos(2 * float(M_PI) * t),
-                    r0 * sin(2 * float(M_PI) * t)
-                };
-                normal = normalize(offset);
-                pdf /= (2 * float(M_PI) * r0);
-                data.path.base_point_id = 0;
-                data.path.point_id = 0;
+            // Both perturbation directions sample the same set of circles, so
+            // undo the factor 0.5 that was applied when choosing the direction.
+            pdf *= 2 * cap_prob / float(num_circles) / (2 * float(M_PI) * r);
+            auto p0 = Vector2f{path.points[2 * pid], path.points[2 * pid + 1]};
+            auto offset = Vector2f{
+                r * cos(2 * float(M_PI) * t),
+                r * sin(2 * float(M_PI) * t)
+            };
+            normal = normalize(offset);
+            if (k < path.num_base_points) {
+                // start vertex of segment k: t = 0 puts all weight on it
+                data.path.base_point_id = k;
+                data.path.point_id = pid;
                 data.path.t = 0;
-                return p0 + offset;
             } else {
-                // Sample the cap at the end
-                auto p0 = Vector2f{path.points[2 * (path.num_points - 1)],
-                                   path.points[2 * (path.num_points - 1) + 1]};
-                auto offset = Vector2f{
-                    r1 * cos(2 * float(M_PI) * t),
-                    r1 * sin(2 * float(M_PI) * t)
-                };
-                normal = normalize(offset);
-                pdf /= (2 * float(M_PI) * r1);
+                // end vertex of the last segment of an open path
                 data.path.base_point_id = path.num_base_points - 1;
-                data.path.point_id = path.num_points - 2 - 
-                                     path.num_control_points[data.path.base_point_id];
+                data.path.point_id = point_id_map[path.num_base_points - 1];
                 data.path.t = 1;
-                return p0 + offset;
             }
+            return p0 + offset;
         } else {
             t = (t - cap_prob) / (1 - cap_prob);
             pdf *= (1 - cap_prob);
@@ -189,6 +227,14 @@ Vector2f sample_boundary(const Path &path,
                 r1 = path.thickness[i1];
             }
             auto r = r0 + t * (r1 - r0);
+            // Jacobian of the offset curve instead of the center curve
+            auto speed = offset_curve_speed(tangent, Vector2f{0, 0}, r, r1 - r0,
+                                            stroke_perturb_direction);
+            if (!(speed > 0)) {
+                pdf = 0;
+                return Vector2f{0, 0};
+            }
+            pdf *= tan_len / speed;
             ret += stroke_perturb_direction * r * normal;
             if (stroke_perturb_direction < 0) {
                 // normal should point towards the perturb direction
@@ -238,6 +284,15 @@ Vector2f sample_boundary(const Path &path,
             }
             auto tt = 1 - t;
             auto r = (tt*tt)*r0 + (2*tt*t)*r1 + (t*t)*r2;
+            auto dr = 2 * tt * (r1 - r0) + 2 * t * (r2 - r1);
+            auto d2 = 2 * (p2 - 2 * p1 + p0);
+            // Jacobian of the offset curve instead of the center curve
+            auto speed = offset_curve_speed(tangent, d2, r, dr, stroke_perturb_direction);
+            if (!(speed > 0)) {
+                pdf = 0;
+                return Vector2f{0, 0};
+            }
+            pdf *= tan_len / speed;
             ret += stroke_perturb_direction * r * normal;
             if (stroke_perturb_direction < 0) {
                 // normal should point towards the perturb direction
@@ -292,6 +347,15 @@ Vector2f sample_boundary(const Path &path,
             }
             auto tt = 1 - t;
             auto r = (tt*tt*tt)*r0 + (3*tt*tt*t)*r1 + (3*tt*t*t)*r2 + (t*t*t)*r3;
+            auto dr = 3 * tt * tt * (r1 - r0) + 6 * tt * t * (r2 - r1) + 3 * t * t * (r3 - r2);
+            auto d2 = 6 * tt * (p2 - 2 * p1 + p0) + 6 * t * (p3 - 2 * p2 + p1);
+            // Jacobian of the offset curve instead of the center curve
+            auto speed = offset_curve_speed(tangent, d2, r, dr, stroke_perturb_direction);
+            if (!(speed > 0)) {
+                pdf = 0;
+                return Vector2f{0, 0};
+            }
+            pdf *= tan_len / speed;
             ret += stroke_perturb_direction * r * normal;
             if (stroke_perturb_direction < 0) {
                 // normal should point towards the perturb direction
@@ -316,6 +380,29 @@ Vector2f sample_boundary(const Rect &rect,
     // Roll a dice to decide whether to sample width or height
     auto w = rect.p_max.x - rect.p_min.x;
     auto h = rect.p_max.y - rect.p_min.y;
+    if (stroke_perturb_direction > 0 && stroke_radius > 0) {
+        // The outer boundary of a stroked rectangle (within_distance of the
+        // four edges) has rounded corners: quarter circles of radius
+        // stroke_radius around each corner. Sample those arcs too.
+        auto arc_length = 2 * float(M_PI) * stroke_radius;
+        auto edge_length = 2 * (w + h);
+        auto arc_prob = arc_length / (arc_length + edge_length);
+        if (t < arc_prob) {
+            t = t / arc_prob;
+            pdf *= arc_prob / arc_length;
+            auto k = min(int(t * 4), 3);
+            auto theta = (float(k) + (t * 4 - float(k))) * float(M_PI) / 2;
+            // angle in [0, pi/2): +x,+y quadrant (y points down) -> p_max corner, etc.
+            auto corner = k == 0 ? rect.p_max :
+                          k == 1 ? Vector2f{rect.p_min.x, rect.p_max.y} :
+                          k == 2 ? rect.p_min :
+                                   Vector2f{rect.p_max.x, rect.p_min.y};
+            normal = Vector2f{cos(theta), sin(theta)};
+            return corner + stroke_radius * normal;
+        }
+        t = (t - arc_prob) / (1 - arc_prob);
+        pdf *= (1 - arc_prob);
+    }
     pdf /= (2 * (w +h));
     if (t <= w / (w + h)) {
         // Sample width

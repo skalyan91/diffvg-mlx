@@ -19,8 +19,98 @@ DEVICE
 inline
 bool closest_point(const Circle &circle, const Vector2f &pt,
                    Vector2f *result) {
-    *result = circle.center + circle.radius * normalize(pt - circle.center);
-    return false;
+    auto dir = pt - circle.center;
+    if (length_squared(dir) < 1e-20f) {
+        // Every boundary point is equally close; pick one.
+        dir = Vector2f{1, 0};
+    }
+    *result = circle.center + circle.radius * normalize(dir);
+    return true;
+}
+
+// Closest point on an axis-aligned ellipse.
+// Eberly, "Distance from a Point to an Ellipse, an Ellipsoid, or a Hyperellipsoid"
+// https://www.geometrictools.com/Documentation/DistancePointEllipseEllipsoid.pdf
+// Works in the first quadrant with e0 >= e1 and uses bisection on the
+// (unique) root of the characteristic function.
+DEVICE
+inline
+double ellipse_get_root(double r0, double z0, double z1, double g) {
+    auto n0 = r0 * z0;
+    auto s0 = z1 - 1;
+    auto s1 = g < 0 ? 0 : sqrt(n0 * n0 + z1 * z1) - 1;
+    auto s = 0.0;
+    for (int i = 0; i < 200; i++) {
+        s = (s0 + s1) / 2;
+        if (s == s0 || s == s1) {
+            break;
+        }
+        auto ratio0 = n0 / (s + r0);
+        auto ratio1 = z1 / (s + 1);
+        g = ratio0 * ratio0 + ratio1 * ratio1 - 1;
+        if (g > 0) {
+            s0 = s;
+        } else if (g < 0) {
+            s1 = s;
+        } else {
+            break;
+        }
+    }
+    return s;
+}
+
+DEVICE
+inline
+bool closest_point(const Ellipse &ellipse, const Vector2f &pt,
+                   Vector2f *result) {
+    double e[2] = {fabs(double(ellipse.radius.x)), fabs(double(ellipse.radius.y))};
+    double u[2] = {double(pt.x) - double(ellipse.center.x),
+                   double(pt.y) - double(ellipse.center.y)};
+    if (!(e[0] > 0) || !(e[1] > 0)) {
+        return false;
+    }
+    // Reflect into the first quadrant and order the axes so that e0 >= e1.
+    int i0 = e[0] >= e[1] ? 0 : 1;
+    int i1 = 1 - i0;
+    auto e0 = e[i0], e1 = e[i1];
+    auto y0 = fabs(u[i0]), y1 = fabs(u[i1]);
+    auto x0 = 0.0, x1 = 0.0;
+    if (y1 > 0) {
+        if (y0 > 0) {
+            auto z0 = y0 / e0;
+            auto z1 = y1 / e1;
+            auto g = z0 * z0 + z1 * z1 - 1;
+            if (g != 0) {
+                auto r0 = (e0 / e1) * (e0 / e1);
+                auto sbar = ellipse_get_root(r0, z0, z1, g);
+                x0 = r0 * y0 / (sbar + r0);
+                x1 = y1 / (sbar + 1);
+            } else {
+                x0 = y0;
+                x1 = y1;
+            }
+        } else {
+            x0 = 0;
+            x1 = e1;
+        }
+    } else {
+        auto numer0 = e0 * y0;
+        auto denom0 = e0 * e0 - e1 * e1;
+        if (numer0 < denom0) {
+            auto xde0 = numer0 / denom0;
+            x0 = e0 * xde0;
+            x1 = e1 * sqrt(std::max(1 - xde0 * xde0, 0.0));
+        } else {
+            x0 = e0;
+            x1 = 0;
+        }
+    }
+    double x[2];
+    x[i0] = u[i0] < 0 ? -x0 : x0;
+    x[i1] = u[i1] < 0 ? -x1 : x1;
+    *result = Vector2f{float(double(ellipse.center.x) + x[0]),
+                       float(double(ellipse.center.y) + x[1])};
+    return true;
 }
 
 DEVICE
@@ -335,7 +425,7 @@ bool closest_point(const Rect &rect, const Vector2f &pt,
             auto d = distance(p, pt);
             if (first || d < min_dist) {
                 min_dist = d;
-                closest_pt = p0;
+                closest_pt = p;
             }
         }
     };
@@ -360,9 +450,7 @@ bool closest_point(const Shape &shape, const BVHNode *bvh_nodes, const Vector2f 
         case ShapeType::Circle:
             return closest_point(*(const Circle *)shape.ptr, pt, result);
         case ShapeType::Ellipse:
-            // https://www.geometrictools.com/Documentation/DistancePointEllipseEllipsoid.pdf
-            assert(false);
-            return false;
+            return closest_point(*(const Ellipse *)shape.ptr, pt, result);
         case ShapeType::Path:
             return closest_point(*(const Path *)shape.ptr, bvh_nodes, pt, max_radius, path_info, result);
         case ShapeType::Rect:
@@ -394,6 +482,22 @@ bool compute_distance(const SceneData &scene,
 
     auto min_dist = max_radius;
     auto found = false;
+    // max_radius is a canvas-space distance, but the BVH and closest_point
+    // queries below run in shape space. A canvas distance d corresponds to a
+    // shape-space distance of at most ||canvas_to_shape||_2 * d, so search
+    // with that (conservative) radius and filter by canvas distance afterwards.
+    auto local_max_radius = max_radius;
+    if (isfinite(max_radius)) {
+        const auto &c = shape_group.canvas_to_shape;
+        // largest singular value of the 2x2 linear part
+        auto a00 = c(0, 0) * c(0, 0) + c(1, 0) * c(1, 0);
+        auto a01 = c(0, 0) * c(0, 1) + c(1, 0) * c(1, 1);
+        auto a11 = c(0, 1) * c(0, 1) + c(1, 1) * c(1, 1);
+        auto half_tr = (a00 + a11) / 2;
+        auto det = a00 * a11 - a01 * a01;
+        auto lambda_max = half_tr + sqrt(max(half_tr * half_tr - det, 0.f));
+        local_max_radius = max_radius * sqrt(max(lambda_max, 0.f));
+    }
 
     while (stack_size > 0) {
         const BVHNode &node = bvh_nodes[bvh_stack[--stack_size]];
@@ -403,10 +507,13 @@ bool compute_distance(const SceneData &scene,
             const auto &shape = scene.shapes[shape_id];
             ClosestPointPathInfo local_path_info{-1, -1};
             auto local_closest_pt = Vector2f{0, 0};
-            if (closest_point(shape, scene.path_bvhs[shape_id], local_pt, max_radius, &local_path_info, &local_closest_pt)) {
+            if (closest_point(shape, scene.path_bvhs[shape_id], local_pt, local_max_radius, &local_path_info, &local_closest_pt)) {
                 auto closest_pt = xform_pt(shape_group.shape_to_canvas, local_closest_pt);
                 auto dist = distance(closest_pt, pt);
-                if (!found || dist < min_dist) {
+                // min_dist starts at max_radius; shapes whose closest_point
+                // does not test max_radius itself (circle, ellipse, rect)
+                // must not be reported beyond it.
+                if (dist < min_dist) {
                     found = true;
                     min_dist = dist;
                     if (min_shape_id != nullptr) {
@@ -423,11 +530,11 @@ bool compute_distance(const SceneData &scene,
         } else {
             assert(node.child0 >= 0 && node.child1 >= 0);
             const AABB &b0 = bvh_nodes[node.child0].box;
-            if (inside(b0, local_pt, max_radius)) {
+            if (inside(b0, local_pt, local_max_radius)) {
                 bvh_stack[stack_size++] = node.child0;
             }
             const AABB &b1 = bvh_nodes[node.child1].box;
-            if (inside(b1, local_pt, max_radius)) {
+            if (inside(b1, local_pt, local_max_radius)) {
                 bvh_stack[stack_size++] = node.child1;
             }
             assert(stack_size <= max_bvh_stack_size);
@@ -446,11 +553,62 @@ void d_closest_point(const Circle &circle,
                      const Vector2f &d_closest_pt,
                      Circle &d_circle,
                      Vector2f &d_pt) {
-    // return circle.center + circle.radius * normalize(pt - circle.center);
-    auto d_center = d_closest_pt *
-        (1 + d_normalize(pt - circle.center, circle.radius * d_closest_pt));
+    // dir = pt - circle.center
+    // return circle.center + circle.radius * normalize(dir);
+    auto dir = pt - circle.center;
+    if (length_squared(dir) < 1e-20f) {
+        return;
+    }
+    auto n = normalize(dir);
+    auto d_dir = d_normalize(dir, circle.radius * d_closest_pt);
+    auto d_center = d_closest_pt - d_dir;
     atomic_add(&d_circle.center.x, d_center);
-    atomic_add(&d_circle.radius, dot(d_closest_pt, normalize(pt - circle.center)));
+    atomic_add(&d_circle.radius, dot(d_closest_pt, n));
+    d_pt += d_dir;
+}
+
+DEVICE
+inline
+void d_closest_point(const Ellipse &ellipse,
+                     const Vector2f &pt,
+                     const Vector2f &d_closest_pt,
+                     Ellipse &d_ellipse,
+                     Vector2f &d_pt) {
+    // The closest point is q(theta) = c + (a cos(theta), b sin(theta)) where
+    // theta is the root of F(theta) = (q - pt) . q'(theta) = 0.
+    // Differentiate q directly and theta implicitly: d_theta = -dF / F_theta.
+    auto closest_pt = Vector2f{0, 0};
+    if (!closest_point(ellipse, pt, &closest_pt)) {
+        return;
+    }
+    auto a = ellipse.radius.x;
+    auto b = ellipse.radius.y;
+    auto c = ellipse.center;
+    auto rel = closest_pt - c;
+    auto theta = atan2(rel.y / b, rel.x / a);
+    auto ct = cos(theta);
+    auto st = sin(theta);
+    auto u = pt - c;
+    // q = c + (a ct, b st)
+    auto d_c = d_closest_pt;
+    auto d_a = d_closest_pt.x * ct;
+    auto d_b = d_closest_pt.y * st;
+    auto d_theta = -d_closest_pt.x * a * st + d_closest_pt.y * b * ct;
+    // F = (b^2 - a^2) st ct + a ux st - b uy ct
+    auto F_theta = (b * b - a * a) * (ct * ct - st * st) + a * u.x * ct + b * u.y * st;
+    auto d_u = Vector2f{0, 0};
+    if (fabs(F_theta) > 1e-8f * max(a * a + b * b, 1e-8f)) {
+        auto k = -d_theta / F_theta;
+        d_u.x = k * (a * st);
+        d_u.y = k * (-b * ct);
+        d_a += k * (-2 * a * st * ct + u.x * st);
+        d_b += k * (2 * b * st * ct - u.y * ct);
+    }
+    // u = pt - c
+    d_c -= d_u;
+    d_pt += d_u;
+    atomic_add(&d_ellipse.center.x, d_c);
+    atomic_add(&d_ellipse.radius.x, Vector2f{d_a, d_b});
 }
 
 DEVICE
@@ -875,8 +1033,11 @@ void d_closest_point(const Shape &shape,
                             d_pt);
             break;
         case ShapeType::Ellipse:
-            // https://www.geometrictools.com/Documentation/DistancePointEllipseEllipsoid.pdf
-            assert(false);
+            d_closest_point(*(const Ellipse *)shape.ptr,
+                            pt,
+                            d_closest_pt,
+                            *(Ellipse *)d_shape.ptr,
+                            d_pt);
             break;
         case ShapeType::Path:
             d_closest_point(*(const Path *)shape.ptr,
