@@ -34,7 +34,7 @@ import diffvg
 from . import scene_gpu_bvh as sgb
 
 __all__ = ['SceneTopology', 'topology_from_args', 'topology_signature', 'build_pools',
-           'grad_index_map', 'clear_topology_cache']
+           'build_pools_from_sources', 'sources_from_args', 'grad_index_map', 'clear_topology_cache']
 
 # ip slots (pydiffvg/metal/common.metal)
 IP_W, IP_H, IP_NSX, IP_NSY = 0, 1, 2, 3
@@ -558,18 +558,13 @@ def _matches(t, args, trust_int_identity = False):
     return True
 
 
-def _build_topology(args):
-    A = mx.array
-    t = SceneTopology()
-    t.nargs = len(args)
-    W, H = int(args[0]), int(args[1])
-    t.canvas_width, t.canvas_height = W, H
-    t.filter_type = _enum_int(args[-2])
-    t.filter_radius_pos = len(args) - 1
-    w = _walk(args)
+def _read_structure(args, w):
+    """
+        Structure arrays (the input of _build_core) and argument positions of
+        serialized scene args, from a _walk result. Reads the int arrays
+        (num_control_points, shape ids) once.
+    """
     S, G = w['S'], w['G']
-    t.num_shapes, t.num_groups = S, G
-
     stype = np.asarray(w['stype'], np.int32).reshape(S)
     pos0 = np.asarray(w['pos0'], np.int64).reshape(S)
     is_path = stype == SHAPE_PATH
@@ -579,76 +574,113 @@ def _build_topology(args):
     nbp = np.asarray(w['p_nbp'], np.int64).reshape(P)
     thick = np.asarray(w['p_thick'], bool).reshape(P)
     nsh = np.asarray(w['nsh'], np.int64).reshape(G)
+    ftype, fpos, fn, sctype, spos, sn = [np.asarray(c, np.int64).reshape(G) for c in w['col']]
+    mpos = np.asarray(w['mpos'], np.int64).reshape(G)
+    sids_pos = np.asarray(w['sids_pos'], np.int64).reshape(G)
+    Nseg, T = int(nbp.sum()), int(nsh.sum())
+    int_pos = tuple(pos0[p_shape].tolist()) + tuple(sids_pos.tolist())
+    int_objs = _pick(args, int_pos)
+    ints_host = _join(int_objs, Nseg + T, np.int32)
+    st = dict(W = int(args[0]), H = int(args[1]), filter_type = _enum_int(args[-2]), stype = stype,
+              p_shape = p_shape, npts = npts, nbp = nbp, thick = thick,
+              closed = np.asarray(w['p_closed'], bool).reshape(P),
+              approx = np.asarray(w['p_approx'], bool).reshape(P),
+              ctrl = ints_host[:Nseg], nsh = nsh, sids = ints_host[Nseg:],
+              ftype = ftype, fn = np.where(ftype > 0, fn, 0),
+              sctype = sctype, sn = np.where(sctype > 0, sn, 0),
+              eo = np.asarray(w['eo'], np.int32).reshape(G))
+    ncolargs_f = np.where(ftype < 0, 0, np.where(ftype == 0, 1, 4))
+    ncolargs_s = np.where(sctype < 0, 0, np.where(sctype == 0, 1, 4))
+    cstart = np.stack([fpos, spos], axis = 1).reshape(-1)
+    ccount = np.stack([ncolargs_f, ncolargs_s], axis = 1).reshape(-1)
+    nonpath = np.nonzero(~is_path)[0]
+    pos = dict(pos0 = pos0, fpos = fpos, spos = spos, mpos = mpos, sids_pos = sids_pos,
+               ncolargs_f = ncolargs_f, int_pos = int_pos, int_objs = int_objs,
+               int_bytes = ints_host.tobytes(),
+               # source positions (sources_from_args)
+               filter_radius = (len(args) - 1,),
+               sw = tuple(np.where(is_path, pos0 + 5, pos0 + 2).tolist()),
+               par = tuple(np.stack([pos0[nonpath], pos0[nonpath] + 1], axis = 1).reshape(-1).tolist()),
+               pts = tuple((pos0[p_shape] + 1).tolist()),
+               th = tuple((pos0[p_shape] + 2)[thick].tolist()),
+               col = tuple(_ranges(np.where(cstart < 0, 0, cstart), ccount).tolist()),
+               mat = tuple(mpos.tolist()))
+    return st, pos
+
+
+def _build_core(st):
+    """
+        SceneTopology from structure arrays only (no scene arguments):
+          W, H, filter_type (int); stype (S,) shape codes; per path (shape
+          order): p_shape (shape ids), npts, nbp (segments), thick, closed,
+          approx; ctrl (sum nbp,) num_control_points of all paths; per group:
+          nsh, ftype / sctype (-1 none, 0 constant, 1 linear, 2 radial), fn / sn
+          (stop counts, 0 unless gradient), eo; sids (sum nsh,) shape ids.
+        Everything the pools need except the float parameters: int pools,
+        float-pool offsets (t.lay) and the gather permutation, kernel inputs,
+        BVH leaf payloads, ip. The float parameters arrive as the "sources"
+        of build_pools_from_sources.
+    """
+    t = SceneTopology()
+    W, H = int(st['W']), int(st['H'])
+    t.canvas_width, t.canvas_height = W, H
+    t.filter_type = int(st['filter_type'])
+    stype = np.asarray(st['stype'], np.int32).reshape(-1)
+    S = int(stype.size)
+    p_shape = np.asarray(st['p_shape'], np.int64).reshape(-1)
+    P = int(p_shape.size)
+    npts = np.asarray(st['npts'], np.int64).reshape(P)
+    nbp = np.asarray(st['nbp'], np.int64).reshape(P)
+    thick = np.asarray(st['thick'], bool).reshape(P)
+    closed = np.asarray(st['closed'], bool).reshape(P)
+    approx = np.asarray(st['approx'], bool).reshape(P)
+    nsh = np.asarray(st['nsh'], np.int64).reshape(-1)
+    G = int(nsh.size)
+    ftype, fn, sctype, sn = [np.asarray(st[k], np.int64).reshape(G) for k in ('ftype', 'fn', 'sctype', 'sn')]
+    fn = np.where(ftype > 0, fn, 0)
+    sn = np.where(sctype > 0, sn, 0)
+    eo = np.asarray(st['eo'], np.int32).reshape(G)
+    ctrl = np.asarray(st['ctrl'], np.int64).reshape(-1)
+    sids = np.asarray(st['sids'], np.int64).reshape(-1)
+    is_path = stype == SHAPE_PATH
+    if S and ((stype < 0) | (stype > 3)).any():
+        raise ValueError('unknown shape type')
+    if not np.array_equal(np.nonzero(is_path)[0], p_shape):
+        raise ValueError('path shape ids do not match the shape types')
+    if ctrl.size != int(nbp.sum()) or sids.size != int(nsh.sum()):
+        raise ValueError('structure sizes are inconsistent')
+    if ((ftype < -1) | (ftype > 2) | (sctype < -1) | (sctype > 2)).any():
+        raise ValueError('unknown colour type')
+    t.num_shapes, t.num_groups = S, G
     empty_group = nsh == 0
     E = int(empty_group.sum())
     t.num_empty_groups = E
-    col =[np.asarray(c, np.int64).reshape(G) for c in w['col']]
-    ftype, fpos, fn, sctype, spos, sn = col
-    eo = np.asarray(w['eo'], np.int32).reshape(G)
-    mpos = np.asarray(w['mpos'], np.int64).reshape(G)
-    sids_pos = np.asarray(w['sids_pos'], np.int64).reshape(G)
     T = int(nsh.sum())
     t.num_total_shapes = T
     Nseg = int(nbp.sum())
     Npts = int(npts.sum())
     t.num_paths, t.num_segments, t.num_points = P, Nseg, Npts
-
-    # arg positions
-    ctrl_pos = pos0[p_shape]
-    pts_pos = pos0[p_shape] + 1
-    th_pos = pos0[p_shape] + 2
-    sw_pos = np.where(is_path, pos0 + 5, pos0 + 2)
-    t.sw_pos = tuple(sw_pos.tolist())
-    # stroke widths and the filter radius may be Python floats or mx.arrays (gradient map)
-    t.swr_pos = t.sw_pos + (len(args) - 1,)
-    t.swr_types = tuple(map(type, _pick(args, t.swr_pos)))
-    t.pts_pos = tuple(pts_pos.tolist())
-    t.th_pos = tuple(th_pos[thick].tolist())
-    nonpath = np.nonzero(~is_path)[0]
-    par_pos = np.stack([pos0[nonpath], pos0[nonpath] + 1], axis = 1).reshape(-1)
-    t.par_pos = tuple(par_pos.tolist())
-    psize = np.select([stype == SHAPE_CIRCLE, stype == SHAPE_ELLIPSE, stype == SHAPE_RECT], [3, 4, 4], 0)
-    t.num_params = int(psize.sum())
-    pbase = np.cumsum(psize) - psize
-
-    # colour args in group order (fill then stroke): pool order of their contents
-    def csize(ct, n):
-        return np.where(ct < 0, 0, np.where(ct == 0, 4, 4 + 5 * n))
-    fsz, ssz = csize(ftype, fn), csize(sctype, sn)
-    ncolargs_f = np.where(ftype < 0, 0, np.where(ftype == 0, 1, 4))
-    ncolargs_s = np.where(sctype < 0, 0, np.where(sctype == 0, 1, 4))
-    cstart = np.stack([fpos, spos], axis = 1).reshape(-1)
-    ccount = np.stack([ncolargs_f, ncolargs_s], axis = 1).reshape(-1)
-    t.col_pos = tuple(_ranges(np.where(cstart < 0, 0, cstart), ccount).tolist())
-    # verification positions of the non-array structural args (enums, None, bools, counts):
-    # canvas/counts, shape types, path is_closed / use_distance_approx / absent thickness,
-    # fill / stroke colour types, use_even_odd_rule, filter type
-    nonarr = np.concatenate([np.arange(4), pos0 - 1, pos0[p_shape] + 3, pos0[p_shape] + 4,
-                             (pos0[p_shape] + 2)[~thick], sids_pos + 1, sids_pos + 2 + ncolargs_f,
-                             mpos - 1, [len(args) - 2]])
-    t.nonarr_pos = tuple(np.sort(nonarr).tolist())
-    t.nonarr_vals = _pick(args, t.nonarr_pos)
-    t.num_col = int(fsz.sum() + ssz.sum())
-    t.mat_pos = tuple(mpos.tolist())
-
-    # int arrays (structure): ctrl in path order, shape ids in group order
-    t.int_pos = tuple(ctrl_pos.tolist()) + tuple(sids_pos.tolist())
-    t.int_count = Nseg + T
-    t.int_objs = _pick(args, t.int_pos)
-    ints_host = _join(t.int_objs, t.int_count, np.int32)
-    t.int_bytes = ints_host.tobytes()
-    ctrl = ints_host[:Nseg].astype(np.int64)
-    sids = ints_host[Nseg:].astype(np.int64)
     if T and (sids.min() < 0 or sids.max() >= S):
         raise ValueError('shape id out of range')
     if Nseg and (ctrl.min() < 0 or ctrl.max() > 2):
         raise ValueError('num_control_points must be 0, 1 or 2')
-    offs_pos = np.concatenate([np.where(ftype > 0, fpos + 2, -1), np.where(sctype > 0, spos + 2, -1)])
-    offs_pos = offs_pos[offs_pos >= 0]
-    struct_pos = np.concatenate([pts_pos, th_pos[thick], offs_pos, offs_pos + 1])
-    t.struct_pos = tuple(struct_pos.tolist())
-    t.struct_objs = _pick(args, t.struct_pos)
-    t.struct_sizes = tuple(map(_SIZE, t.struct_objs))
+
+    circ = stype == SHAPE_CIRCLE
+    er = (stype == SHAPE_ELLIPSE) | (stype == SHAPE_RECT)
+    psize = np.select([circ, stype == SHAPE_ELLIPSE, stype == SHAPE_RECT], [3, 4, 4], 0)
+    t.num_params = int(psize.sum())
+    pbase = np.cumsum(psize) - psize
+    # serialized (radius, center) / (p_min, p_max) values -> shape_params (S, 4)
+    # rows [a b c d]; index num_params is an appended zero
+    p2s = np.full((S, 4), t.num_params, np.int64)
+    p2s[circ, :3] = pbase[circ, None] + np.arange(3)
+    p2s[er] = pbase[er, None] + np.arange(4)
+    t.par_to_sp_m = mx.array(p2s.reshape(-1).astype(np.int32))
+
+    def csize(ct, n):
+        return np.where(ct < 0, 0, np.where(ct == 0, 4, 4 + 5 * n))
+    fsz, ssz = csize(ftype, fn), csize(sctype, sn)
+    t.num_col = int(fsz.sum() + ssz.sum())
 
     # ---- node pool (scene BVH, group BVHs, path BVHs)
     # A group without shapes (the C++ core does not support it: Scene
@@ -684,6 +716,10 @@ def _build_topology(args):
     points_off = f_off[p_shape] + 5
     th_off = np.where(thick, points_off + 2 * npts, -1)
     cdf_off = points_off + 2 * npts + thick * npts
+    t.lay = dict(f_off = f_off, points_off = points_off, th_off = th_off, fill_off = fill_off,
+                 stroke_off = stroke_off, gf_off = gf_off, fsz = fsz, ssz = ssz, stype = stype,
+                 p_shape = p_shape, npts = npts, nbp = nbp, thick = thick, circ = circ, er = er,
+                 ftype = ftype, fn = fn, sctype = sctype, sn = sn)
 
     # ---- int pool layout
     I0 = 12 * S + 12 * G
@@ -708,17 +744,17 @@ def _build_topology(args):
     srec[p_shape, 7] = path_base
     srec[p_shape, 8] = cdf_off
     srec[p_shape, 9] = pid_off
-    srec[p_shape, 10] = np.asarray(w['p_closed'], np.int32).reshape(P)
-    srec[p_shape, 11] = np.asarray(w['p_approx'], np.int32).reshape(P)
+    srec[p_shape, 10] = closed.astype(np.int32)
+    srec[p_shape, 11] = approx.astype(np.int32)
     grec = np.zeros((G, 12), np.int32)
     grec[:, 0] = sid_off
     grec[:, 1] = nsh
     grec[:, 2] = ftype
     grec[:, 3] = fill_off
-    grec[:, 4] = np.where(ftype > 0, fn, 0)
+    grec[:, 4] = fn
     grec[:, 5] = sctype
     grec[:, 6] = stroke_off
-    grec[:, 7] = np.where(sctype > 0, sn, 0)
+    grec[:, 7] = sn
     grec[:, 8] = eo
     grec[:, 9] = np.where(empty_group, group_base + 2, group_base)
     grec[:, 10] = gf_off
@@ -742,10 +778,13 @@ def _build_topology(args):
     t.ints_tail_np = tail.astype(np.int32)
 
     # ---- float pool gather permutation for [F0, NF)
+    # source vector: [0 | stroke_width (S) | shape_params (4S) | path lengths (P) |
+    #   points | thickness | segment cdf | segment pmf | colours | shape_to_canvas (9G) |
+    #   canvas_to_shape (9G) | sample cdf (T) | sample pmf (T)]
     SRC_ZERO = 0
     SRC_SW = 1
-    SRC_PAR = SRC_SW + S
-    SRC_D = SRC_PAR + t.num_params
+    SRC_SP = SRC_SW + S
+    SRC_D = SRC_SP + 4 * S
     SRC_PTS = SRC_D + P
     Nth = int(npts[thick].sum())
     SRC_TH = SRC_PTS + 2 * Npts
@@ -757,15 +796,14 @@ def _build_topology(args):
     SRC_SCDF = SRC_C2S + 9 * G
     SRC_SPMF = SRC_SCDF + T
     t.num_thickness = Nth
-    circ = stype == SHAPE_CIRCLE
-    er = (stype == SHAPE_ELLIPSE) | (stype == SHAPE_RECT)
     if S > 0:
         rest = NF - F0
         perm = np.full(rest, -1, np.int64)
         perm[f_off - F0] = SRC_SW + np.arange(S)
+        sidx = np.arange(S, dtype = np.int64)
         pmat = np.full((S, 4), SRC_ZERO, np.int64)
-        pmat[circ, :3] = SRC_PAR + pbase[circ, None] + np.arange(3)
-        pmat[er] = SRC_PAR + pbase[er, None] + np.arange(4)
+        pmat[circ, :3] = SRC_SP + 4 * sidx[circ, None] + np.arange(3)
+        pmat[er] = SRC_SP + 4 * sidx[er, None] + np.arange(4)
         pmat[p_shape, 3] = SRC_D + np.arange(P)
         perm[(f_off - F0)[:, None] + 1 + np.arange(4)] = pmat
         perm[_ranges(points_off - F0, 2 * npts)] = SRC_PTS + np.arange(2 * Npts)
@@ -781,8 +819,9 @@ def _build_topology(args):
         perm[SF0 + T - F0 + np.arange(T)] = SRC_SPMF + np.arange(T)
         assert (perm >= 0).all(), 'float pool layout has holes'
         t.float_perm_m = mx.array(perm.astype(np.int32))
-    t.src_sizes = dict(sw = S, par = t.num_params, d = P, pts = 2 * Npts, th = Nth, cdf = Nseg,
-                       pmf = Nseg, col = t.num_col, s2c = 9 * G, c2s = 9 * G, scdf = T, spmf = T)
+    # sizes of the float sources (build_pools_from_sources)
+    t.src_sizes = dict(filter_radius = 1, stroke_width = S, shape_params = 4 * S, points = 2 * Npts,
+                       thickness = Nth, colors = t.num_col, shape_to_canvas = 9 * G)
 
     # ---- per-call kernel inputs (static parts)
     th_start = np.cumsum(np.where(thick, npts, 0)) - np.where(thick, npts, 0)
@@ -792,16 +831,17 @@ def _build_topology(args):
     t.ctrl_m = mx.array(ctrl.astype(np.int32))
     t.path_shape_m = mx.array(p_shape.astype(np.int32))
     # shape lengths (sample tables) and shape bboxes: gather from [circle, ellipse, rect, path]
-    nc, ne, nr = int(circ.sum()), int((stype == SHAPE_ELLIPSE).sum()), int((stype == SHAPE_RECT).sum())
+    is_ell, is_rect = stype == SHAPE_ELLIPSE, stype == SHAPE_RECT
+    nc, ne, nr = int(circ.sum()), int(is_ell.sum()), int(is_rect.sum())
     order_idx = np.zeros(S, np.int64)
     order_idx[circ] = np.arange(nc)
-    order_idx[stype == SHAPE_ELLIPSE] = nc + np.arange(ne)
-    order_idx[stype == SHAPE_RECT] = nc + ne + np.arange(nr)
+    order_idx[is_ell] = nc + np.arange(ne)
+    order_idx[is_rect] = nc + ne + np.arange(nr)
     order_idx[p_shape] = nc + ne + nr + np.arange(P)
     t.shape_gather_m = mx.array(order_idx.astype(np.int32))
-    t.circle_pb_m = mx.array(pbase[circ].astype(np.int32))
-    t.ellipse_pb_m = mx.array(pbase[stype == SHAPE_ELLIPSE].astype(np.int32))
-    t.rect_pb_m = mx.array(pbase[stype == SHAPE_RECT].astype(np.int32))
+    t.circle_sid_m = mx.array(np.nonzero(circ)[0].astype(np.int32))
+    t.ellipse_sid_m = mx.array(np.nonzero(is_ell)[0].astype(np.int32))
+    t.rect_sid_m = mx.array(np.nonzero(is_rect)[0].astype(np.int32))
     t.counts = (nc, ne, nr)
     t.sample_sid_m = mx.array(sids.astype(np.int32))
 
@@ -869,13 +909,55 @@ def _build_topology(args):
         ip[IP_NUM_BVH_NODES] = N
     t.ip = ip
     t.num_floats, t.num_ints = NF, NI
+    return t
+
+
+def _attach_args(t, args, st, pos):
+    """ Serialized-args specifics of a topology: argument positions, cache verification, gradient map. """
+    A = mx.array
+    S, P = t.num_shapes, t.num_paths
+    L = t.lay
+    t.nargs = len(args)
+    t.filter_radius_pos = len(args) - 1
+    t.src_pos = {k: pos[k] for k in ('filter_radius', 'sw', 'par', 'pts', 'th', 'col', 'mat')}
+    t.sw_pos = pos['sw']
+    # stroke widths and the filter radius may be Python floats or mx.arrays (gradient map)
+    t.swr_pos = t.sw_pos + (len(args) - 1,)
+    t.swr_types = tuple(map(type, _pick(args, t.swr_pos)))
+    pos0, p_shape, thick = pos['pos0'], L['p_shape'], L['thick']
+    fpos, spos, mpos, sids_pos = pos['fpos'], pos['spos'], pos['mpos'], pos['sids_pos']
+    ftype, sctype = L['ftype'], L['sctype']
+    # verification positions of the non-array structural args (enums, None, bools, counts):
+    # canvas/counts, shape types, path is_closed / use_distance_approx / absent thickness,
+    # fill / stroke colour types, use_even_odd_rule, filter type
+    nonarr = np.concatenate([np.arange(4), pos0 - 1, pos0[p_shape] + 3, pos0[p_shape] + 4,
+                             (pos0[p_shape] + 2)[~thick], sids_pos + 1, sids_pos + 2 + pos['ncolargs_f'],
+                             mpos - 1, [len(args) - 2]])
+    t.nonarr_pos = tuple(np.sort(nonarr).tolist())
+    t.nonarr_vals = _pick(args, t.nonarr_pos)
+    t.mat_pos = pos['mat']
+    # int arrays (structure): ctrl in path order, shape ids in group order
+    t.int_pos = pos['int_pos']
+    t.int_count = t.num_segments + t.num_total_shapes
+    t.int_objs = pos['int_objs']
+    t.int_bytes = pos['int_bytes']
+    pts_pos = pos0[p_shape] + 1
+    th_pos = pos0[p_shape] + 2
+    offs_pos = np.concatenate([np.where(ftype > 0, fpos + 2, -1), np.where(sctype > 0, spos + 2, -1)])
+    offs_pos = offs_pos[offs_pos >= 0]
+    struct_pos = np.concatenate([pts_pos, th_pos[thick], offs_pos, offs_pos + 1])
+    t.struct_pos = tuple(struct_pos.tolist())
+    t.struct_objs = _pick(args, t.struct_pos)
+    t.struct_sizes = tuple(map(_SIZE, t.struct_objs))
 
     # ---- gradient index map as contiguous ranges: (arg position, pool start, count)
+    f_off, points_off, th_off = L['f_off'], L['points_off'], L['th_off']
+    circ, er, npts = L['circ'], L['er'], L['npts']
     gp, gs, gl = [], [], []
-    def add(pos, start, count):
-        gp.append(np.asarray(pos, np.int64).reshape(-1))
+    def add(p, start, count):
+        gp.append(np.asarray(p, np.int64).reshape(-1))
         gs.append(np.asarray(start, np.int64).reshape(-1))
-        gl.append(np.broadcast_to(np.asarray(count, np.int64), np.shape(np.asarray(pos).reshape(-1))))
+        gl.append(np.broadcast_to(np.asarray(count, np.int64), np.shape(np.asarray(p).reshape(-1))))
     if S > 0:
         add(pos0[circ], f_off[circ] + 1, 1)
         add(pos0[circ] + 1, f_off[circ] + 2, 2)
@@ -886,8 +968,8 @@ def _build_topology(args):
         sw_arr = np.fromiter(map(operator.is_, t.swr_types[:S], (A,) * S), bool, count = S)
         sw_mapped = sw_arr.copy()
         sw_mapped[p_shape[thick]] = False
-        add(sw_pos[sw_mapped], f_off[sw_mapped], 1)
-        for ct, cp, cn, co in ((ftype, fpos, fn, fill_off), (sctype, spos, sn, stroke_off)):
+        add(np.asarray(t.sw_pos, np.int64)[sw_mapped], f_off[sw_mapped], 1)
+        for ct, cp, cn, co in ((ftype, fpos, L['fn'], L['fill_off']), (sctype, spos, L['sn'], L['stroke_off'])):
             cst = ct == 0
             add(cp[cst], co[cst], 4)
             gr = ct > 0
@@ -895,7 +977,7 @@ def _build_topology(args):
             add(cp[gr] + 1, co[gr] + 2, 2)
             add(cp[gr] + 2, co[gr] + 4, cn[gr])
             add(cp[gr] + 3, co[gr] + 4 + cn[gr], 4 * cn[gr])
-        add(mpos, gf_off, 9)
+        add(mpos, L['gf_off'], 9)
     if t.swr_types[-1] is A:
         add([t.filter_radius_pos], [0], 1)
     t.grad_pos = np.concatenate(gp) if gp else np.zeros(0, np.int64)
@@ -904,6 +986,13 @@ def _build_topology(args):
     order = np.argsort(t.grad_pos, kind = 'stable')
     t.grad_pos, t.grad_start, t.grad_len = t.grad_pos[order], t.grad_start[order], t.grad_len[order]
     t._grad_list = None
+
+
+def _build_topology(args):
+    w = _walk(args)
+    st, pos = _read_structure(args, w)
+    t = _build_core(st)
+    _attach_args(t, args, st, pos)
     return t
 
 
@@ -956,7 +1045,7 @@ def grad_index_map(topology):
 # ---------------------------------------------------------------------------
 # Pools
 
-def _category(t, args, name, pos, count):
+def _category(args, pos, count):
     """
         mx.float32 array of the concatenated args at `pos`, read fresh on
         every call (in-place updates of the same mx.array are not detectable
@@ -985,10 +1074,52 @@ def _fill_call_slots(ip, width, height, nsx, nsy, seed, use_prefiltering, eval_c
     return ip
 
 
+SOURCE_KEYS = ('filter_radius', 'stroke_width', 'shape_params', 'points', 'thickness', 'colors',
+               'shape_to_canvas')
+
+
+def _sources(args, pos, t):
+    radius = _category(args, pos['filter_radius'], 1)
+    if t.num_shapes == 0:
+        return dict(filter_radius = radius)
+    par = _category(args, pos['par'], t.num_params)
+    sz = t.src_sizes
+    return dict(filter_radius = radius,
+                stroke_width = _category(args, pos['sw'], sz['stroke_width']),
+                shape_params = mx.concatenate([par, mx.zeros((1,), mx.float32)])[t.par_to_sp_m],
+                points = _category(args, pos['pts'], sz['points']),
+                thickness = _category(args, pos['th'], sz['thickness']),
+                colors = _category(args, pos['col'], sz['colors']),
+                shape_to_canvas = _category(args, pos['mat'], sz['shape_to_canvas']))
+
+
+def sources_from_args(topology, args):
+    """
+        The float sources of build_pools_from_sources gathered from serialized
+        scene args (one bytes join per category, read fresh on every call).
+    """
+    return _sources(args, topology.src_pos, topology)
+
+
 def build_pools(topology, args, width, height, nsx, nsy, seed, use_prefiltering = False,
                 eval_count = 0, has_background = False, refit_from = None):
+    """ build_pools_from_sources on the float parameters of serialized args (structure = topology). """
+    return build_pools_from_sources(topology, sources_from_args(topology, args), width, height, nsx,
+                                    nsy, seed, use_prefiltering, eval_count, has_background, refit_from)
+
+
+def build_pools_from_sources(topology, sources, width, height, nsx, nsy, seed, use_prefiltering = False,
+                             eval_count = 0, has_background = False, refit_from = None):
     """
-        Flat pools for `args` (whose structure must match `topology`).
+        Flat pools for a topology and its float parameters. sources: dict of
+        flat mx.float32 arrays (sizes in topology.src_sizes):
+          filter_radius (1), stroke_width (S), shape_params (4S; rows [a b c d]
+          as the pool shape record: circle radius cx cy -, ellipse rx ry cx cy,
+          rect pmin pmax, path unused), points (2 * total points, x y per point,
+          paths in shape order), thickness (per-point widths of thickness
+          paths), colors (fill then stroke colour block of each group, pool
+          layout), shape_to_canvas (9G, row major).
+        Only filter_radius is needed when the scene has no shapes.
         Returns a dict:
           ip      mx.int32[64]   (per-call slots 0-3, 10-14, 28 filled)
           ip_np   numpy copy of ip
@@ -998,15 +1129,15 @@ def build_pools(topology, args, width, height, nsx, nsy, seed, use_prefiltering 
                         (edge sampling needs > 0), lazy
           bvh     (path_build, group_build, scene_build) BVHBuild or None
           leaves  per-kind (boxes, radii) used by the builds (for refit)
-        refit_from: a previous build_pools result for the same topology: the
-        BVH leaf order and topology are reused (refit_bvhs) instead of
-        rebuilding. The traversal stays valid but may differ from the CPU.
+        refit_from: a previous result for the same topology: the BVH leaf
+        order and topology are reused (refit_bvhs) instead of rebuilding. The
+        traversal stays valid but may differ from the CPU.
     """
     t = topology
     S, G, T, P = t.num_shapes, t.num_groups, t.num_total_shapes, t.num_paths
     ip = _fill_call_slots(t.ip, width, height, nsx, nsy, seed, use_prefiltering, eval_count,
                           has_background)
-    radius = _category(t, args, 'radius', (t.filter_radius_pos,), 1)
+    radius = sources['filter_radius'].reshape(1)
     out = dict(ip_np = ip, ip = mx.array(ip), num_ints = t.num_ints, num_floats = t.num_floats,
                topology = t, bvh = None, leaves = None)
     if S == 0:
@@ -1014,13 +1145,12 @@ def build_pools(topology, args, width, height, nsx, nsy, seed, use_prefiltering 
         out['ints'] = mx.zeros((MIN_POOL,), mx.int32)
         out['total_length'] = mx.array(0.0)
         return out
-    sz = t.src_sizes
-    sw = _category(t, args, 'sw', t.sw_pos, S)
-    par = _category(t, args, 'par', t.par_pos, sz['par'])
-    pts = _category(t, args, 'pts', t.pts_pos, sz['pts'])
-    th = _category(t, args, 'th', t.th_pos, sz['th'])
-    col = _category(t, args, 'col', t.col_pos, sz['col'])
-    s2c = _category(t, args, 'mat', t.mat_pos, sz['s2c'])
+    sw = sources['stroke_width'].reshape(-1)
+    sp = sources['shape_params'].reshape(-1)
+    pts = sources['points'].reshape(-1)
+    th = sources['thickness'].reshape(-1)
+    col = sources['colors'].reshape(-1)
+    s2c = sources['shape_to_canvas'].reshape(-1)
 
     # paths: lengths, CDFs, bboxes, segment leaves
     nc, ne, nr = t.counts
@@ -1043,19 +1173,20 @@ def build_pools(topology, args, width, height, nsx, nsy, seed, use_prefiltering 
     lens, boxes = [], []
     two_pi = mx.array(np.float32(2.0 * np.pi))
     zero = mx.array(0.0, dtype = mx.float32)
+    spm = sp.reshape(S, 4)
     if nc:
-        pb = t.circle_pb_m
-        r, cx, cy = par[pb], par[pb + 1], par[pb + 2]
+        c = spm[t.circle_sid_m]
+        r, cx, cy = c[:, 0], c[:, 1], c[:, 2]
         lens.append(zero + two_pi * r)
         boxes.append(mx.stack([cx - r, cy - r, cx + r, cy + r], axis = 1))
     if ne:
-        pb = t.ellipse_pb_m
-        rx, ry, cx, cy = par[pb], par[pb + 1], par[pb + 2], par[pb + 3]
+        c = spm[t.ellipse_sid_m]
+        rx, ry, cx, cy = c[:, 0], c[:, 1], c[:, 2], c[:, 3]
         lens.append(_run('ellipse', [mx.stack([rx, ry], axis = 1)], ne, [ne], [mx.float32])[0])
         boxes.append(mx.stack([cx - rx, cy - ry, cx + rx, cy + ry], axis = 1))
     if nr:
-        pb = t.rect_pb_m
-        x0, y0, x1, y1 = par[pb], par[pb + 1], par[pb + 2], par[pb + 3]
+        c = spm[t.rect_sid_m]
+        x0, y0, x1, y1 = c[:, 0], c[:, 1], c[:, 2], c[:, 3]
         two = mx.array(2.0, dtype = mx.float32)
         lens.append(zero + two * (((x1 - x0) + y1) - y0))
         boxes.append(mx.stack([x0, y0, x1, y1], axis = 1))
@@ -1139,8 +1270,8 @@ def build_pools(topology, args, width, height, nsx, nsy, seed, use_prefiltering 
     nodes_f = _cat([p[0] for p in parts])
     nodes_i = mx.concatenate([p[1].reshape(-1) for p in parts]) if parts else mx.zeros((0,), mx.int32)
 
-    src = _cat([zero.reshape(1), sw, par, path_len, pts, th, seg_cdf, seg_pmf, col, s2c, c2s, scdf, spmf])
-    floats = mx.concatenate([radius.reshape(1), nodes_f, src[t.float_perm_m]])
+    src = _cat([zero.reshape(1), sw, sp, path_len, pts, th, seg_cdf, seg_pmf, col, s2c, c2s, scdf, spmf])
+    floats = mx.concatenate([radius, nodes_f, src[t.float_perm_m]])
     ints = mx.concatenate([t.ints_head_m, nodes_i, t.ints_tail_m])
     out['floats'] = _pad(floats, MIN_POOL)
     out['ints'] = _pad(ints, MIN_POOL)

@@ -5,7 +5,9 @@
 
     Shared Metal code: pydiffvg/metal/{common, geometry, color, backward,
     distance_grad, prefilter}.metal. The *_flat functions take pools from
-    scene_gpu.build_pools (mx arrays) or export_flat (numpy), as in
+    scene_gpu.build_pools / build_pools_from_sources (mx arrays; the latter
+    is also used by the packed-parameter API, pydiffvg/packed.py) or
+    export_flat (numpy), as in
     render_metal.py; the scene-argument level helpers (flat_scene, *_gpu)
     build the scene with the C++ core.
 

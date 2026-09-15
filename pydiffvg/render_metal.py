@@ -2,7 +2,8 @@
     Metal (Apple GPU) backend for diffvg.
 
     The flat scene pools (layout in pydiffvg/metal/common.metal) come either
-    from pydiffvg/scene_gpu.py (MLX arrays built on the GPU; the default) or
+    from pydiffvg/scene_gpu.py (MLX arrays built on the GPU; the default; for
+    packed scenes, pydiffvg/packed.py, straight from the params arrays) or
     from the C++ core's diffvg.Scene.export_flat() (numpy); every function
     taking pools accepts both (see render_mlx._scene_pools). They are
     rasterised by mx.fast.metal_kernel kernels whose shared code lives in

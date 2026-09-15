@@ -144,7 +144,59 @@ Options on the GPU backend:
 - `pydiffvg.set_scene_topology_trust(True)` skips re-reading integer arrays (control-point counts, shape ids) that are the same objects as in the previous call. It is faster for very large scenes but **unsafe if you modify those arrays in place**, so it is off by default. Float parameters are always re-read, so in-place updates of points, colours and transforms are safe.
 - Shape groups with no shapes are supported by the GPU scene builder; the C++ core (CPU backend or `'cpu'` builder) raises an error for them.
 
-With tens of thousands of separate parameter arrays, `mx.value_and_grad` itself becomes the bottleneck: tracing gradients for all 213,000 arrays of `contour.svg` takes most of the 97 s of a gradient step, while rendering takes under 2 s. Keep parameters in a few large arrays and slice them when building shapes.
+# Packed parameters
+With one small array per shape, large scenes spend most of their time outside the renderer: `contour.svg` has 212,969 parameter arrays, and `mx.value_and_grad` over all of them is slow to trace. A packed scene keeps all parameters in seven arrays instead:
+
+| Key | Shape | Contents |
+|---|---|---|
+| `points` | (points, 2) | the points of every path and polygon, in shape order |
+| `thickness` | (points with thickness,) | per-point widths of paths with variable thickness |
+| `stroke_width` | (shapes,) | stroke width of each shape |
+| `shape_params` | (shapes, 4) | circle [r, cx, cy, 0], ellipse [rx, ry, cx, cy], rectangle [p_min, p_max], zeros for paths |
+| `shape_to_canvas` | (groups, 3, 3) | transform of each shape group |
+| `colors` | (colour values,) | fill block then stroke block of each group: constant [r, g, b, a], or gradient [begin/end or centre/radius (4), stop offsets (n), stop colours (4n)] |
+| `filter_radius` | () | pixel filter radius |
+
+`pydiffvg.pack_scene(canvas_width, canvas_height, shapes, shape_groups)` (or `pydiffvg.svg_to_packed_scene(filename)`) returns a packed scene with a fixed `structure` and a `params` dict of those arrays. `pydiffvg.render_packed` is differentiable with respect to the whole dict, `pydiffvg.unpack_scene` converts back to shapes (for example for `save_svg`), and helpers such as `scene.path_points(shape_id)` and `scene.group_fill_slice(group_id)` give the index ranges of each shape and group in the arrays:
+```python
+import mlx.core as mx
+import mlx.optimizers as optim
+import pydiffvg
+
+scene = pydiffvg.svg_to_packed_scene("imgs/tiger.svg")
+w, h = scene.canvas_width, scene.canvas_height
+target = pydiffvg.render_packed(scene, scene.params, w, h, 2, 2, 0)
+
+params = dict(scene.params)
+params["points"] = params["points"] + 3 * mx.random.normal(params["points"].shape)
+
+def loss_fn(params):
+    img = pydiffvg.render_packed(scene, params, w, h, 2, 2, 0)
+    return mx.mean((img - target) ** 2)
+
+loss_and_grad = mx.value_and_grad(loss_fn)
+point_optimizer = optim.Adam(learning_rate = 0.5, bias_correction = True)
+color_optimizer = optim.Adam(learning_rate = 0.01, bias_correction = True)
+for t in range(50):
+    loss, grads = loss_and_grad(params)
+    geometry, colors = {"points": params["points"]}, {"colors": params["colors"]}
+    point_optimizer.update(geometry, {"points": grads["points"]})
+    color_optimizer.update(colors, {"colors": grads["colors"]})
+    params["points"] = geometry["points"]
+    params["colors"] = mx.clip(colors["colors"], 0, 1)
+    mx.eval(params, point_optimizer.state, color_optimizer.state)
+```
+Use separate learning rates for geometry and colours: a step size that suits pixel coordinates destroys colour values in [0, 1].
+
+The structure of a packed scene is fixed, so changing the number of points of a path or the shapes of a group needs a new `pack_scene`. On the GPU backend the packed path builds the scene with one gather from these arrays; the CPU backend unpacks the scene and renders it with the C++ core, which is correct but not faster.
+
+Timings on the GPU backend (colour, 2×2 samples per pixel, warm):
+
+| Scene | Forward, per-shape arrays | Forward, packed | Gradients, per-shape arrays | Gradients, packed |
+|---|---|---|---|---|
+| `tiger.svg` | 0.038 s | 0.033 s | 0.300 s | 0.196 s |
+| `hawaii.svg` | 2.29 s | 1.98 s | 12.6 s | 10.8 s |
+| `contour.svg` | 1.93 s | 0.035 s | 10.2 s | 0.100 s |
 
 Colour output at `eval_positions` is not supported by either backend. The GPU uses the same random sample positions as the CPU, so forward renders agree up to float32 rounding: pixels whose sample lies within about 1e-6 px of an edge can switch coverage. Gradients agree with the CPU within Monte Carlo noise and with finite differences.
 

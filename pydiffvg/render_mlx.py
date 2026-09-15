@@ -459,7 +459,10 @@ def _gpu_mode(args):
         output at eval_positions is unsupported by the CPU core too, so it
         stays on the CPU (which asserts).
     """
-    output_type, use_prefiltering, eval_positions = args[4], args[5], args[6]
+    return _gpu_mode_of(args[4], args[5], args[6])
+
+def _gpu_mode_of(output_type, use_prefiltering, eval_positions):
+    """ _gpu_mode for explicit render settings (also used by pydiffvg/packed.py). """
     if output_type == OutputType.sdf:
         return 'sdf'
     if eval_positions is not None and eval_positions.shape[0] > 0:
@@ -632,17 +635,16 @@ def _scene_pools(args, width, height, num_samples_x, num_samples_y, seed, use_pr
     return {'ip': ip, 'ints': ints, 'floats': floats, 'grads': grads, 'builder': 'cpu',
             'scene': built}
 
-def _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args):
+def _prepare_kernels(mode, prepared, width, height, num_samples_x, num_samples_y, seed,
+                     background_image):
     """
-        Scene pools plus, for 'color', the prepared kernel inputs and weight
-        image ('flat'); for 'prefiltered', the weight image ('weight').
+        Adds to scene pools (a dict with ip / ints / floats) the prepared
+        kernel inputs and weight image for 'color' ('flat') or the weight
+        image for 'prefiltered' ('weight'). Shared by the per-shape and the
+        packed (pydiffvg/packed.py) paths.
     """
     from . import render_metal
     from . import render_metal_stage3 as r3
-    ev = _eval_positions_arg(args)
-    use_pref = bool(args[5])
-    prepared = _scene_pools(args, width, height, num_samples_x, num_samples_y, seed, use_pref,
-                            0 if ev is None else int(ev.shape[0]), background_image is not None)
     ip, ints, floats = prepared['ip'], prepared['ints'], prepared['floats']
     if mode == 'color':
         if background_image is not None:
@@ -654,6 +656,18 @@ def _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed, backgr
                                                         num_samples_x, num_samples_y, seed)
     return prepared
 
+def _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args):
+    """
+        Scene pools plus, for 'color', the prepared kernel inputs and weight
+        image ('flat'); for 'prefiltered', the weight image ('weight').
+    """
+    ev = _eval_positions_arg(args)
+    use_pref = bool(args[5])
+    prepared = _scene_pools(args, width, height, num_samples_x, num_samples_y, seed, use_pref,
+                            0 if ev is None else int(ev.shape[0]), background_image is not None)
+    return _prepare_kernels(mode, prepared, width, height, num_samples_x, num_samples_y, seed,
+                            background_image)
+
 def _check_background_gpu(background_image, width, height):
     if background_image.shape[2] == 3:
         raise NotImplementedError('Background image must have 4 channels, not 3. Add a fourth channel with all ones via mx.ones().')
@@ -662,17 +676,23 @@ def _check_background_gpu(background_image, width, height):
 def _forward_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args,
                  scene_cache):
     """ Metal forward pass; caches the pools (and weight image) in scene_cache for the vjp. """
-    from . import render_metal
-    from . import render_metal_stage3 as r3
     prepared = _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
                             background_image, args)
     scene_cache['gpu'] = prepared
+    return _forward_gpu_prepared(mode, prepared, width, height, num_samples_x, num_samples_y, seed,
+                                 background_image, _eval_positions_arg(args), bool(args[5]))
+
+def _forward_gpu_prepared(mode, prepared, width, height, num_samples_x, num_samples_y, seed,
+                          background_image, eval_positions, use_prefiltering):
+    """ Metal forward pass on prepared pools (_prepare_kernels). """
+    from . import render_metal
+    from . import render_metal_stage3 as r3
     if mode == 'color':
         return render_metal.render_color_prepared(prepared['flat'])
     ip, ints, floats = prepared['ip'], prepared['ints'], prepared['floats']
     if mode == 'sdf':
         return r3.sdf_forward_flat(ip, ints, floats, width, height, num_samples_x, num_samples_y,
-                                   seed, _eval_positions_arg(args), bool(args[5]))
+                                   seed, eval_positions, use_prefiltering)
     return r3.prefiltered_forward_flat(ip, ints, floats, width, height, num_samples_x,
                                        num_samples_y, seed, background_image,
                                        weight_image = prepared['weight'])
@@ -686,42 +706,59 @@ def _backward_gpu(mode, width, height, num_samples_x, num_samples_y, seed, backg
         render_image: the forward output (prefiltered filter-radius gradient).
         scene_cache: the forward pass's cache (rebuilt when empty).
     """
-    from . import render_metal
-    from . import render_metal_stage3 as r3
     prepared = scene_cache.get('gpu')
     if prepared is None:
         prepared = _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
                                 background_image, args)
+    d_floats, d_bg = _backward_gpu_prepared(mode, prepared, width, height, num_samples_x,
+                                            num_samples_y, seed, background_image,
+                                            _eval_positions_arg(args), bool(args[5]), grad_img,
+                                            render_image)
+    return [d_bg] + prepared['grads'](d_floats)
+
+def _backward_gpu_prepared(mode, prepared, width, height, num_samples_x, num_samples_y, seed,
+                           background_image, eval_positions, use_prefiltering, grad_img,
+                           render_image):
+    """ Metal backward pass on prepared pools. Returns (d_floats, d_background or None). """
+    from . import render_metal
+    from . import render_metal_stage3 as r3
     ip, ints, floats = prepared['ip'], prepared['ints'], prepared['floats']
     if mode == 'color':
         d_floats, d_bg, _ = render_metal.render_backward_prepared(prepared['flat'], grad_img)
     elif mode == 'sdf':
         d_floats, _ = r3.sdf_backward_flat(ip, ints, floats, width, height, num_samples_x,
-                                           num_samples_y, seed, grad_img,
-                                           _eval_positions_arg(args), False, bool(args[5]))
+                                           num_samples_y, seed, grad_img, eval_positions, False,
+                                           use_prefiltering)
         d_bg = None
     else:
         d_floats, d_bg, _ = r3.prefiltered_backward_flat(
             ip, ints, floats, width, height, num_samples_x, num_samples_y, seed,
             background_image, grad_img, render_image = render_image,
             weight_image = prepared['weight'])
-    return [d_bg] + prepared['grads'](d_floats)
+    return d_floats, d_bg
 
 def _render_grad_gpu(mode, grad_img, width, height, num_samples_x, num_samples_y, seed,
                      background_image, args):
     """ Screen-space translation gradient image (height, width, 2) on Metal. """
-    from . import render_metal
-    from . import render_metal_stage3 as r3
     prepared = _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
                             background_image, args)
+    return _render_grad_gpu_prepared(mode, prepared, grad_img, width, height, num_samples_x,
+                                     num_samples_y, seed, background_image,
+                                     _eval_positions_arg(args), bool(args[5]))
+
+def _render_grad_gpu_prepared(mode, prepared, grad_img, width, height, num_samples_x, num_samples_y,
+                              seed, background_image, eval_positions, use_prefiltering):
+    """ Translation gradient image on prepared pools (evaluated). """
+    from . import render_metal
+    from . import render_metal_stage3 as r3
     ip, ints, floats = prepared['ip'], prepared['ints'], prepared['floats']
     if mode == 'color':
         _, _, d_tr = render_metal.render_backward_prepared(prepared['flat'], grad_img,
                                                            want_translation = True)
     elif mode == 'sdf':
         _, d_tr = r3.sdf_backward_flat(ip, ints, floats, width, height, num_samples_x,
-                                       num_samples_y, seed, grad_img, _eval_positions_arg(args),
-                                       True, bool(args[5]))
+                                       num_samples_y, seed, grad_img, eval_positions,
+                                       True, use_prefiltering)
     else:
         _, _, d_tr = r3.prefiltered_backward_flat(ip, ints, floats, width, height, num_samples_x,
                                                   num_samples_y, seed, background_image, grad_img,
