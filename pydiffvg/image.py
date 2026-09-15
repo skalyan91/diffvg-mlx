@@ -9,7 +9,8 @@ def imwrite(img, filename, gamma = 2.2, normalize = False):
         os.makedirs(directory)
 
     if not isinstance(img, np.ndarray):
-        img = img.data.numpy()
+        # Copy: the gamma correction below writes into the array in place.
+        img = np.array(img)
     if normalize:
         img_rng = np.max(img) - np.min(img)
         if img_rng > 0:
@@ -19,4 +20,7 @@ def imwrite(img, filename, gamma = 2.2, normalize = False):
         #repeat along the third dimension
         img=np.expand_dims(img,2)
     img[:, :, :3] = np.power(img[:, :, :3], 1.0/gamma)
+    if img.shape[2] == 1:
+        # Single-channel images (e.g. SDFs) must be saved as greyscale
+        img = img[:, :, 0]
     skimage.io.imsave(filename, (img * 255).astype(np.uint8))

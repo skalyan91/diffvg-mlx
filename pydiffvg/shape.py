@@ -1,16 +1,18 @@
-import torch
+import mlx.core as mx
+import numpy as np
+import array
 import svgpathtools
 import math
 
 class Circle:
-    def __init__(self, radius, center, stroke_width = torch.tensor(1.0), id = ''):
+    def __init__(self, radius, center, stroke_width = mx.array(1.0), id = ''):
         self.radius = radius
         self.center = center
         self.stroke_width = stroke_width
         self.id = id
 
 class Ellipse:
-    def __init__(self, radius, center, stroke_width = torch.tensor(1.0), id = ''):
+    def __init__(self, radius, center, stroke_width = mx.array(1.0), id = ''):
         self.radius = radius
         self.center = center
         self.stroke_width = stroke_width
@@ -21,7 +23,7 @@ class Path:
                  num_control_points,
                  points,
                  is_closed,
-                 stroke_width = torch.tensor(1.0),
+                 stroke_width = mx.array(1.0),
                  id = '',
                  use_distance_approx = False):
         self.num_control_points = num_control_points
@@ -32,14 +34,14 @@ class Path:
         self.use_distance_approx = use_distance_approx
 
 class Polygon:
-    def __init__(self, points, is_closed, stroke_width = torch.tensor(1.0), id = ''):
+    def __init__(self, points, is_closed, stroke_width = mx.array(1.0), id = ''):
         self.points = points
         self.is_closed = is_closed
         self.stroke_width = stroke_width
         self.id = id
 
 class Rect:
-    def __init__(self, p_min, p_max, stroke_width = torch.tensor(1.0), id = ''):
+    def __init__(self, p_min, p_max, stroke_width = mx.array(1.0), id = ''):
         self.p_min = p_min
         self.p_max = p_max
         self.stroke_width = stroke_width
@@ -51,7 +53,7 @@ class ShapeGroup:
                  fill_color,
                  use_even_odd_rule = True,
                  stroke_color = None,
-                 shape_to_canvas = torch.eye(3),
+                 shape_to_canvas = mx.eye(3),
                  id = ''):
         self.shape_ids = shape_ids
         self.fill_color = fill_color
@@ -60,10 +62,11 @@ class ShapeGroup:
         self.shape_to_canvas = shape_to_canvas
         self.id = id
 
-def from_svg_path(path_str, shape_to_canvas = torch.eye(3), force_close = False):
+def from_svg_path(path_str, shape_to_canvas = mx.eye(3), force_close = False):
     path = svgpathtools.parse_path(path_str)
     if len(path) == 0:
         return []
+    transform = np.asarray(shape_to_canvas, dtype=np.float32)
     ret_paths = []
     subpaths = path.continuous_subpaths()
     for subpath in subpaths:
@@ -164,9 +167,14 @@ def from_svg_path(path_str, shape_to_canvas = torch.eye(3), force_close = False)
                     assert(e.end.imag == points[0][1])
                 else:
                     points.append((e.end.real, e.end.imag))
-        points = torch.tensor(points, dtype=torch.float)
-        points = torch.cat((points, torch.ones([points.shape[0], 1])), dim = 1) @ torch.transpose(shape_to_canvas, 0, 1)
+        # Transform with numpy (float32, exact like the CPU matmul) and create
+        # the mx.array once: per-path mx ops dominated parsing time.
+        flat = array.array('f', [v for xy in points for v in xy])
+        homogeneous = np.empty([len(points), 3], dtype=np.float32)
+        homogeneous[:, :2] = np.frombuffer(flat, dtype=np.float32).reshape(-1, 2)
+        homogeneous[:, 2] = 1.0
+        points = np.matmul(homogeneous, transform.T)
         points = points / points[:, 2:3]
-        points = points[:, :2].contiguous()
-        ret_paths.append(Path(torch.tensor(num_control_points), points, subpath.isclosed()))
+        points = mx.array(points[:, :2])
+        ret_paths.append(Path(mx.array(num_control_points, dtype=mx.int32), points, subpath.isclosed()))
     return ret_paths

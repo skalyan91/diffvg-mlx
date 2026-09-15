@@ -1,26 +1,22 @@
 import pydiffvg
-import torch
-import skimage
+import mlx.core as mx
 import numpy as np
-import matplotlib.pyplot as plt
-
-# Use GPU if available
-pydiffvg.set_use_gpu(torch.cuda.is_available())
+from finite_difference_comp import viridis
 
 canvas_width, canvas_height = 256, 256
-num_control_points = torch.tensor([1])
-points = torch.tensor([[ 50.0,  30.0], # base
-                       [125.0, 400.0], # control point
-                       [170.0,  30.0]]) # base
+num_control_points = mx.array([1])
+points = mx.array([[ 50.0,  30.0], # base
+                   [125.0, 400.0], # control point
+                   [170.0,  30.0]]) # base
 path = pydiffvg.Path(num_control_points = num_control_points,
                      points = points,
-                     stroke_width = torch.tensor([30.0]),
+                     stroke_width = mx.array([30.0]),
                      is_closed = False,
                      use_distance_approx = False)
 shapes = [path]
-path_group = pydiffvg.ShapeGroup(shape_ids = torch.tensor([0]),
+path_group = pydiffvg.ShapeGroup(shape_ids = mx.array([0]),
                                  fill_color = None,
-                                 stroke_color = torch.tensor([0.5, 0.5, 0.5, 0.5]))
+                                 stroke_color = mx.array([0.5, 0.5, 0.5, 0.5]))
 shape_groups = [path_group]
 scene_args = pydiffvg.RenderFunction.serialize_scene(\
     canvas_width, canvas_height, shapes, shape_groups,
@@ -33,9 +29,8 @@ img = render(256, # width
              0,   # seed
              None, # background_image
              *scene_args)
-img /= 256.0
-cm = plt.get_cmap('viridis')
-img = cm(img.squeeze())
+img = img / 256.0
+img = viridis(np.array(img).squeeze())
 pydiffvg.imwrite(img, 'results/quadratic_distance_approx/ref_sdf.png')
 
 scene_args = pydiffvg.RenderFunction.serialize_scene(\
@@ -60,8 +55,8 @@ img = render(256, # width
              0,   # seed
              None, # background_image
              *scene_args)
-img /= 256.0
-img = cm(img.squeeze())
+img = img / 256.0
+img = viridis(np.array(img).squeeze())
 pydiffvg.imwrite(img, 'results/quadratic_distance_approx/approx_sdf.png')
 
 scene_args = pydiffvg.RenderFunction.serialize_scene(\

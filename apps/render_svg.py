@@ -4,7 +4,6 @@ Simple utility to render an .svg to a .png
 import os
 import argparse
 import pydiffvg
-import torch as th
 
 
 def render(canvas_width, canvas_height, shapes, shape_groups):
@@ -22,8 +21,6 @@ def render(canvas_width, canvas_height, shapes, shape_groups):
 
 
 def main(args):
-    pydiffvg.set_device(th.device('cuda:1'))
-
     # Load SVG
     svg = os.path.join(args.svg)
     canvas_width, canvas_height, shapes, shape_groups = \
@@ -31,7 +28,7 @@ def main(args):
 
     # Save initial state
     ref = render(canvas_width, canvas_height, shapes, shape_groups)
-    pydiffvg.imwrite(ref.cpu(), args.out, gamma=2.2)
+    pydiffvg.imwrite(ref, args.out, gamma=2.2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

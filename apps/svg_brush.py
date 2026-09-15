@@ -1,9 +1,9 @@
+# Interactive editor. Requires pygame and tkinter in addition to pydiffvg.
 import sys
-sys.path.append("../svg")
 from geometry import GeometryLoss
 import numpy as np
 import pygame as pg
-import torch
+import mlx.core as mx
 import pydiffvg
 import tkinter as tk
 from tkinter import filedialog
@@ -27,13 +27,13 @@ def brush_tensor(screen_size,coords,radius,kernel):
     ctrarr = np.reshape(np.array(coords), [1, 1, 2])
     distarr=np.sqrt(np.sum(np.power(coordarr-ctrarr,2),axis=2))
     valarr=kernel(distarr/radius)
-    return torch.tensor(valarr,requires_grad=False,dtype=torch.float32)
+    return mx.array(valarr,dtype=mx.float32)
 
 def checkerboard(shape, square_size=2):
     xv,yv=np.meshgrid(np.floor(np.linspace(0,shape[1]-1,shape[1])/square_size),np.floor(np.linspace(0,shape[0]-1,shape[0])/square_size))
     bin=np.expand_dims(((xv+yv)%2),axis=2)
     res=bin*np.array([[[1., 1., 1.,]]])+(1-bin)*np.array([[[.75, .75, .75,]]])
-    return torch.tensor(res,requires_grad=False,dtype=torch.float32)
+    return mx.array(res,dtype=mx.float32)
 
 def render(optim, viewport):
     scene_args = pydiffvg.RenderFunction.serialize_scene(*optim.build_scene())
@@ -47,13 +47,11 @@ def render(optim, viewport):
                  *scene_args)
     return img
 
-def optimize(optim, viewport, brush_kernel, increase=True, strength=0.1):
-    optim.zero_grad()
+def brush_loss(optim, viewport, brush_kernel, increase, strength):
+    geomLoss=mx.array(0.)
 
-    geomLoss=torch.tensor(0.)
-
-    for shape, gloss in zip(optim.scene[2],geometryLosses):
-        geomLoss+=gloss.compute(shape)
+    for shape, gloss in zip(optim.build_scene()[2],geometryLosses):
+        geomLoss=geomLoss+gloss.compute(shape)
 
     img=render(optim,viewport)
 
@@ -61,18 +59,16 @@ def optimize(optim, viewport, brush_kernel, increase=True, strength=0.1):
 
     multiplied=imalpha*brush_kernel
 
-    loss=((1-multiplied).mean() if increase else multiplied.mean())*strength
+    loss=(mx.mean(1-multiplied) if increase else mx.mean(multiplied))*strength
 
-    loss+=geomLoss
+    return loss+geomLoss
 
-    loss.backward()
-
-    optim.step()
+def optimize(optim, viewport, brush_kernel, increase=True, strength=0.1):
+    optim.optimize_step(brush_loss, viewport, brush_kernel, increase, strength)
 
     return render(optim,viewport)
 
 def get_infile():
-    pydiffvg.set_use_gpu(False)
     root = tk.Tk()
     #root.withdraw()
 
@@ -86,7 +82,7 @@ def compositebg(img):
     bg=checkerboard(img.shape,2)
     color=img[:,:,0:3]
     alpha=img[:,:,3]
-    composite=alpha.unsqueeze(2)*color+(1-alpha).unsqueeze(2)*bg
+    composite=mx.expand_dims(alpha,2)*color+mx.expand_dims(1-alpha,2)*bg
 
     return composite
 
@@ -120,7 +116,7 @@ def main():
     img=render(optim,graphic_size)
     print(img.max())
 
-    npsurf = pg.transform.scale(nptosurf(compositebg(img).detach().permute(1,0,2).numpy()), screen_size)
+    npsurf = pg.transform.scale(nptosurf(np.array(compositebg(img).transpose(1,0,2))), screen_size)
 
     screen.blit(npsurf,(0,0))
 
@@ -154,7 +150,7 @@ def main():
         if z==1:
             brush=brush_tensor((graphic_size[0],graphic_size[1]), (x/scaling, y/scaling), brush_radius, box_kernel)
             img=optimize(optim,graphic_size,brush,btn==1)
-            npsurf = pg.transform.scale(nptosurf(compositebg(img).detach().permute(1,0,2).numpy()), screen_size)
+            npsurf = pg.transform.scale(nptosurf(np.array(compositebg(img).transpose(1,0,2))), screen_size)
 
 
         screen.blit(npsurf,(0,0))
@@ -164,4 +160,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

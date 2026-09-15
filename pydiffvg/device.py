@@ -1,25 +1,20 @@
-import torch
+import mlx.core as mx
 
-use_gpu = torch.cuda.is_available()
-device = torch.device('cuda') if use_gpu else torch.device('cpu')
+# The diffvg core runs on the CPU (with its own thread pool);
+# the GPU code path is CUDA-only and is not built.
+use_gpu = False
+device = mx.cpu
 
 def set_use_gpu(v):
-    global use_gpu
-    global device
-    use_gpu = v
-    if not use_gpu:
-        device = torch.device('cpu')
+    if v:
+        raise NotImplementedError('diffvg-mlx only supports rendering on the CPU.')
 
 def get_use_gpu():
-    global use_gpu
     return use_gpu
 
 def set_device(d):
-    global device
-    global use_gpu
-    device = d
-    use_gpu = device.type == 'cuda'
+    if d != mx.cpu:
+        raise NotImplementedError('diffvg-mlx only supports rendering on the CPU.')
 
 def get_device():
-    global device
     return device

@@ -30,8 +30,8 @@ def main(args):
     print('PSNR img1:', 20 * math.log10(1.0 / math.sqrt(np.mean(np.power(img1 - ref, 2.0)))))
     print('PSNR img2:', 20 * math.log10(1.0 / math.sqrt(np.mean(np.power(img2 - ref, 2.0)))))
     # SSIM
-    print('SSIM img1:', ssim(img1, ref, multichannel=True))
-    print('SSIM img2:', ssim(img2, ref, multichannel=True))
+    print('SSIM img1:', ssim(img1, ref, channel_axis=2, data_range=1.0))
+    print('SSIM img2:', ssim(img2, ref, channel_axis=2, data_range=1.0))
 
     skimage.io.imsave('diff1.png', (diff1 * 255).astype(np.uint8))
     skimage.io.imsave('diff2.png', (diff2 * 255).astype(np.uint8))

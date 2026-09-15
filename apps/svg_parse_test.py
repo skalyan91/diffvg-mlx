@@ -1,19 +1,15 @@
 import pydiffvg
-import sys
 import numpy as np
-import torch
-sys.path.append("../pydiffvg")
+import mlx.core as mx
 
-from optimize_svg import OptimizableSvg
-
-pydiffvg.set_use_gpu(False)
+from pydiffvg import OptimizableSvg
 
 """
 for x in range(100000):
     inmat=np.eye(3)
     inmat[0:2,:]=(np.random.rand(2,3)-0.5)*2
     decomp=OptimizableSvg.TransformTools.decompose(inmat)
-    outmat=OptimizableSvg.TransformTools.recompose(torch.tensor(decomp[0],dtype=torch.float32),torch.tensor(decomp[1],dtype=torch.float32),torch.tensor(decomp[2],dtype=torch.float32),torch.tensor(decomp[3],dtype=torch.float32)).numpy()
+    outmat=np.array(OptimizableSvg.TransformTools.recompose(mx.array(decomp[0],dtype=mx.float32),mx.array(decomp[1],dtype=mx.float32),mx.array(decomp[2],dtype=mx.float32),mx.array(decomp[3],dtype=mx.float32)))
     dif=np.linalg.norm(inmat-outmat)
     if dif > 1e-3:
         print(dif)
@@ -38,7 +34,7 @@ img = render(canvas_width, # width
              None, # background_image
              *scene_args)
 # The output image is in linear RGB space. Do Gamma correction before saving the image.
-pydiffvg.imwrite(img.cpu(), 'test_old.png', gamma=1.0)
+pydiffvg.imwrite(img, 'test_old.png', gamma=1.0)
 
 #optim=OptimizableSvg('linux.svg',verbose=True)
 optim=OptimizableSvg(infile,verbose=True)
@@ -60,6 +56,6 @@ with open("resaved.svg","w") as f:
     f.write(optim.write_xml())
 
 # The output image is in linear RGB space. Do Gamma correction before saving the image.
-pydiffvg.imwrite(img.cpu(), 'test_new.png', gamma=1.0)
+pydiffvg.imwrite(img, 'test_new.png', gamma=1.0)
 
 print("Done!")
