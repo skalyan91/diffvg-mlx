@@ -10,6 +10,10 @@ struct PathBoundaryData {
     int base_point_id;
     int point_id;
     float t;
+    // +-1 for a sample on a stroke flank (offset curve c + dir r n) of a path
+    // with per-point thickness, whose normal is then the offset-curve normal;
+    // 0 otherwise (fills, uniform-width strokes, end caps / joins).
+    float offset_dir;
 };
 
 struct BoundaryData {
@@ -30,6 +34,25 @@ float offset_curve_speed(const Vector2f &d1, const Vector2f &d2,
     auto n = Vector2f{-d1.y, d1.x} / len;
     auto dn = Vector2f{-d2.y, d2.x} / len - n * (dot(d1, d2) / (len * len));
     return length(d1 + dir * (dr * n + r * dn));
+}
+
+// Unit normal of the offset curve b(t) = c(t) + dir * r(t) * n(t) (tangent
+// d1 + dir * (dr * n + r * dn), see offset_curve_speed), oriented to agree
+// with n = perp(c') / |c'|. For a varying radius (dr != 0) it is tilted from n
+// by atan(dr / ((1 + dir r curvature) |c'|)).
+DEVICE
+inline
+Vector2f offset_curve_normal(const Vector2f &d1, const Vector2f &d2,
+                             float r, float dr, float dir, const Vector2f &n) {
+    auto len = length(d1);
+    auto dn = Vector2f{-d2.y, d2.x} / len - n * (dot(d1, d2) / (len * len));
+    auto bt = d1 + dir * (dr * n + r * dn);
+    auto bl = length(bt);
+    if (!(bl > 0)) {
+        return n;
+    }
+    auto nb = Vector2f{-bt.y, bt.x} / bl;
+    return dot(nb, n) < 0 ? -nb : nb;
 }
 
 DEVICE
@@ -228,14 +251,22 @@ Vector2f sample_boundary(const Path &path,
             }
             auto r = r0 + t * (r1 - r0);
             // Jacobian of the offset curve instead of the center curve
-            auto speed = offset_curve_speed(tangent, Vector2f{0, 0}, r, r1 - r0,
-                                            stroke_perturb_direction);
+            auto dr = r1 - r0;
+            auto d2 = Vector2f{0, 0};
+            auto speed = offset_curve_speed(tangent, d2, r, dr, stroke_perturb_direction);
             if (!(speed > 0)) {
                 pdf = 0;
                 return Vector2f{0, 0};
             }
             pdf *= tan_len / speed;
             ret += stroke_perturb_direction * r * normal;
+            if (path.thickness != nullptr) {
+                // The offset curve is not parallel to the centre curve when the
+                // thickness varies: use its own normal for the Reynolds term.
+                // (The point b = c + dir r n and the pdf speed |b'| are unchanged.)
+                normal = offset_curve_normal(tangent, d2, r, dr, stroke_perturb_direction, normal);
+                data.path.offset_dir = stroke_perturb_direction;
+            }
             if (stroke_perturb_direction < 0) {
                 // normal should point towards the perturb direction
                 normal = -normal;
@@ -294,6 +325,13 @@ Vector2f sample_boundary(const Path &path,
             }
             pdf *= tan_len / speed;
             ret += stroke_perturb_direction * r * normal;
+            if (path.thickness != nullptr) {
+                // The offset curve is not parallel to the centre curve when the
+                // thickness varies: use its own normal for the Reynolds term.
+                // (The point b = c + dir r n and the pdf speed |b'| are unchanged.)
+                normal = offset_curve_normal(tangent, d2, r, dr, stroke_perturb_direction, normal);
+                data.path.offset_dir = stroke_perturb_direction;
+            }
             if (stroke_perturb_direction < 0) {
                 // normal should point towards the perturb direction
                 normal = -normal;
@@ -357,6 +395,13 @@ Vector2f sample_boundary(const Path &path,
             }
             pdf *= tan_len / speed;
             ret += stroke_perturb_direction * r * normal;
+            if (path.thickness != nullptr) {
+                // The offset curve is not parallel to the centre curve when the
+                // thickness varies: use its own normal for the Reynolds term.
+                // (The point b = c + dir r n and the pdf speed |b'| are unchanged.)
+                normal = offset_curve_normal(tangent, d2, r, dr, stroke_perturb_direction, normal);
+                data.path.offset_dir = stroke_perturb_direction;
+            }
             if (stroke_perturb_direction < 0) {
                 // normal should point towards the perturb direction
                 normal = -normal;
@@ -499,6 +544,7 @@ Vector2f sample_boundary(const SceneData &scene,
         stroke_perturb = true;
     }
     data.is_stroke = stroke_perturb;
+    data.path.offset_dir = 0;
     auto stroke_perturb_direction = 0.f;
     if (stroke_perturb) {
         if (t < 0.5f) {

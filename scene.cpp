@@ -227,8 +227,19 @@ void build_shape_cdfs(Scene &scene,
         }
     }
     assert(sample_id == scene.num_total_shapes);
-    auto normalization = scene.sample_shapes_cdf[scene.num_total_shapes - 1];
-    if (normalization <= 0) {
+    auto normalization = scene.num_total_shapes > 0 ?
+        scene.sample_shapes_cdf[scene.num_total_shapes - 1] : 0.f;
+    if (normalization == 0) {
+        // Nothing to edge-sample (e.g. only zero-length paths). Fills and
+        // strokes still render; leave the tables at zero so that render()
+        // skips edge sampling (and sample_boundary_kernel rejects pmf 0).
+        for (int i = 0; i < scene.num_total_shapes; i++) {
+            scene.sample_shapes_cdf[i] = 0;
+            scene.sample_shapes_pmf[i] = 0;
+        }
+        return;
+    }
+    if (normalization < 0) {
         char buf[256];
         sprintf(buf, "The total length of the shape boundaries in the scene is equal or less than 0. Length = %f", normalization);
         throw std::runtime_error(buf);
@@ -326,6 +337,18 @@ void build_path_cdfs(Scene &scene,
                     }
                 } else {
                     assert(false);
+                }
+            }
+            if (!(path_length > 0)) {
+                // Zero-length path (e.g. a single point): 1 / path_length made
+                // the tables 0/0 = NaN. Use a uniform distribution over the
+                // segments so that the tables stay finite and sample() never
+                // divides by a zero-width cdf interval. (Such a path has
+                // sample_shapes_pmf == 0, so edge sampling skips it anyway.)
+                auto n = path.num_base_points;
+                for (int i = 0; i < n; i++) {
+                    pmf[i] = 1.f / float(n);
+                    cdf[i] = float(i + 1) / float(n);
                 }
             }
         }
@@ -629,13 +652,28 @@ void compute_bounding_boxes(Scene &scene,
         }
     }
     
+    // Largest stroke radius of a shape. For a path with per-point thickness the
+    // serialized stroke_width is a dummy; the maximum thickness over all
+    // segments is stored at the root of its path BVH (node 2 * num_base_points - 2;
+    // node 0 is merely the first y-sorted leaf).
+    auto stroke_max_radius = [&](int shape_id) -> float {
+        const Shape *shape = shape_list[shape_id];
+        if (shape->type == ShapeType::Path) {
+            const Path *p = (const Path*)(shape->ptr);
+            if (p->thickness != nullptr) {
+                return scene.path_bvhs[shape_id][2 * p->num_base_points - 2].max_radius;
+            }
+        }
+        return shape->stroke_width;
+    };
+
     for (int shape_group_id = 0; shape_group_id < (int)shape_group_list.size(); shape_group_id++) {
         const ShapeGroup *shape_group = shape_group_list[shape_group_id];
         // Build a BVH for each shape group
         BVHNode *nodes = scene.shape_groups_bvh_nodes[shape_group_id];
         for (int i = 0; i < shape_group->num_shapes; i++) {
             auto shape_id = shape_group->shape_ids[i];
-            auto r = shape_group->stroke_color == nullptr ? 0 : shape_list[shape_id]->stroke_width;
+            auto r = shape_group->stroke_color == nullptr ? 0 : stroke_max_radius(shape_id);
             nodes[i] = BVHNode{shape_id,
                                -1,
                                scene.shapes_bbox[shape_id],
@@ -647,26 +685,9 @@ void compute_bounding_boxes(Scene &scene,
     BVHNode *nodes = scene.bvh_nodes;
     for (int shape_group_id = 0; shape_group_id < (int)shape_group_list.size(); shape_group_id++) {
         const ShapeGroup *shape_group = shape_group_list[shape_group_id];
-        auto max_radius = shape_list[shape_group->shape_ids[0]]->stroke_width;
-        if (shape_list[shape_group->shape_ids[0]]->type == ShapeType::Path) {
-            const Path *p = (const Path*)(shape_list[shape_group->shape_ids[0]]->ptr);
-            if (p->thickness != nullptr) {
-                const BVHNode *nodes = scene.path_bvhs[shape_group->shape_ids[0]];
-                max_radius = nodes[0].max_radius;
-            }
-        }
+        auto max_radius = stroke_max_radius(shape_group->shape_ids[0]);
         for (int i = 1; i < shape_group->num_shapes; i++) {
-            auto shape_id = shape_group->shape_ids[i];
-            auto shape = shape_list[shape_id];
-            auto r = shape->stroke_width;
-            if (shape->type == ShapeType::Path) {
-                const Path *p = (const Path*)(shape_list[shape_id]->ptr);
-                if (p->thickness != nullptr) {
-                    const BVHNode *nodes = scene.path_bvhs[shape_id];
-                    r = nodes[0].max_radius;
-                }
-            }
-            max_radius = std::max(max_radius, r);
+            max_radius = std::max(max_radius, stroke_max_radius(shape_group->shape_ids[i]));
         }
         // Fetch group bbox from BVH
         auto bbox = scene.shape_groups_bvh_nodes[shape_group_id][2 * shape_group->num_shapes - 2].box;
@@ -930,6 +951,31 @@ Scene::Scene(int canvas_width,
       use_gpu(use_gpu),
       gpu_index(gpu_index) {
     if (num_shapes == 0) {
+        // Empty scene: only the filter is needed (render() still runs the
+        // weight / render kernels, which read it, and export_flat exports it).
+        num_total_shapes = 0;
+        size_t size = align(sizeof(Filter)) + align(sizeof(DFilter));
+        allocate<uint8_t>(use_gpu, size, &buffer);
+        this->filter = (Filter*)&buffer[0];
+        this->d_filter = (DFilter*)&buffer[align(sizeof(Filter))];
+        *(this->filter) = filter;
+        this->d_filter->radius = 0;
+        shapes = nullptr;
+        d_shapes = nullptr;
+        shape_groups = nullptr;
+        d_shape_groups = nullptr;
+        shapes_bbox = nullptr;
+        path_bvhs = nullptr;
+        shape_groups_bvh_nodes = nullptr;
+        bvh_nodes = nullptr;
+        shapes_length = nullptr;
+        sample_shapes_cdf = nullptr;
+        sample_shapes_pmf = nullptr;
+        sample_shape_id = nullptr;
+        sample_group_id = nullptr;
+        path_length_cdf = nullptr;
+        path_length_pmf = nullptr;
+        path_point_id_map = nullptr;
         return;
     }
     // Shape group may reuse some of the shapes,
@@ -998,9 +1044,7 @@ Scene::Scene(int canvas_width,
 }
 
 Scene::~Scene() {
-    if (num_shapes == 0) {
-        return;
-    }
+    // (empty scenes allocate a small buffer for the filter too)
     if (use_gpu) {
 #ifdef __NVCC__
         int old_device_id = -1;
@@ -1032,4 +1076,260 @@ ShapeGroup Scene::get_d_shape_group(int group_id) const {
 
 float Scene::get_d_filter_radius() const {
     return d_filter->radius;
+}
+
+namespace {
+// Indices into the ip block (see pydiffvg/metal/common.metal)
+enum {
+    IP_W = 0, IP_H = 1, IP_NSX = 2, IP_NSY = 3,
+    IP_CANVAS_W = 4, IP_CANVAS_H = 5, IP_NUM_SHAPES = 6, IP_NUM_GROUPS = 7,
+    IP_NUM_TOTAL_SHAPES = 8, IP_FILTER_TYPE = 9,
+    IP_SCENE_BVH_BASE = 15, IP_SHAPES_I_OFF = 16, IP_GROUPS_I_OFF = 17,
+    IP_BVH_I_OFF = 18, IP_SAMPLE_SHAPE_ID_OFF = 19, IP_SAMPLE_GROUP_ID_OFF = 20,
+    IP_BVH_F_OFF = 21, IP_SAMPLE_CDF_OFF = 22, IP_SAMPLE_PMF_OFF = 23,
+    IP_FILTER_RADIUS_OFF = 24, IP_NUM_FLOATS = 25, IP_NUM_INTS = 26,
+    IP_NUM_BVH_NODES = 27
+};
+const int IP_SIZE = 64;
+const int MIN_POOL_SIZE = 64;
+const int SHAPE_I_STRIDE = 12;
+const int GROUP_I_STRIDE = 12;
+
+int bvh_num_nodes(int num_primitives) {
+    return num_primitives > 0 ? 2 * num_primitives - 1 : 0;
+}
+}
+
+void Scene::export_flat(std::vector<int> &ip,
+                        std::vector<int> &ints,
+                        std::vector<float> &floats) const {
+    ip.assign(IP_SIZE, 0);
+    ints.clear();
+    floats.clear();
+    ip[IP_W] = canvas_width;
+    ip[IP_H] = canvas_height;
+    ip[IP_NSX] = 1;
+    ip[IP_NSY] = 1;
+    ip[IP_CANVAS_W] = canvas_width;
+    ip[IP_CANVAS_H] = canvas_height;
+
+    if (num_shapes == 0) {
+        // The constructor returned early: nothing else is initialised.
+        // Every offset points at index 0 of the (zero-padded) pools.
+        // The filter is exported as for non-empty scenes (radius at float 0).
+        ip[IP_FILTER_TYPE] = (int)filter->type;
+        ip[IP_FILTER_RADIUS_OFF] = 0;
+        ip[IP_NUM_FLOATS] = 1;
+        ints.assign(MIN_POOL_SIZE, 0);
+        floats.assign(MIN_POOL_SIZE, 0.f);
+        floats[0] = filter->radius;
+        return;
+    }
+
+    auto push_f = [&](float v) { floats.push_back(v); };
+    auto push_i = [&](int v) { ints.push_back(v); };
+
+    // Filter
+    ip[IP_FILTER_TYPE] = (int)filter->type;
+    ip[IP_FILTER_RADIUS_OFF] = (int)floats.size();
+    push_f(filter->radius);
+
+    // Node pool: scene BVH, then group BVHs, then path BVHs.
+    int num_nodes = 0;
+    ip[IP_SCENE_BVH_BASE] = num_nodes;
+    num_nodes += bvh_num_nodes(num_shape_groups);
+    std::vector<int> group_bvh_base(num_shape_groups);
+    for (int g = 0; g < num_shape_groups; g++) {
+        group_bvh_base[g] = num_nodes;
+        num_nodes += bvh_num_nodes(shape_groups[g].num_shapes);
+    }
+    std::vector<int> path_bvh_base(num_shapes, -1);
+    for (int s = 0; s < num_shapes; s++) {
+        if (shapes[s].type == ShapeType::Path) {
+            path_bvh_base[s] = num_nodes;
+            num_nodes += bvh_num_nodes(((const Path *)shapes[s].ptr)->num_base_points);
+        }
+    }
+    ip[IP_NUM_BVH_NODES] = num_nodes;
+
+    // Fixed-size int blocks first
+    ip[IP_SHAPES_I_OFF] = (int)ints.size();
+    ints.resize(ints.size() + SHAPE_I_STRIDE * num_shapes, 0);
+    ip[IP_GROUPS_I_OFF] = (int)ints.size();
+    ints.resize(ints.size() + GROUP_I_STRIDE * num_shape_groups, 0);
+    ip[IP_BVH_I_OFF] = (int)ints.size();
+    ints.resize(ints.size() + 2 * num_nodes, 0);
+    ip[IP_BVH_F_OFF] = (int)floats.size();
+    floats.resize(floats.size() + 5 * num_nodes, 0.f);
+
+    auto write_nodes = [&](const BVHNode *nodes, int count, int base) {
+        for (int n = 0; n < count; n++) {
+            const BVHNode &node = nodes[n];
+            int fo = ip[IP_BVH_F_OFF] + 5 * (base + n);
+            floats[fo] = node.box.p_min.x;
+            floats[fo + 1] = node.box.p_min.y;
+            floats[fo + 2] = node.box.p_max.x;
+            floats[fo + 3] = node.box.p_max.y;
+            floats[fo + 4] = node.max_radius;
+            int io = ip[IP_BVH_I_OFF] + 2 * (base + n);
+            ints[io] = node.child0;
+            ints[io + 1] = node.child1;
+        }
+    };
+    write_nodes(bvh_nodes, bvh_num_nodes(num_shape_groups), ip[IP_SCENE_BVH_BASE]);
+    for (int g = 0; g < num_shape_groups; g++) {
+        write_nodes(shape_groups_bvh_nodes[g], bvh_num_nodes(shape_groups[g].num_shapes),
+                    group_bvh_base[g]);
+    }
+
+    // Shapes
+    for (int s = 0; s < num_shapes; s++) {
+        const Shape &shape = shapes[s];
+        int rec = ip[IP_SHAPES_I_OFF] + SHAPE_I_STRIDE * s;
+        ints[rec + 0] = (int)shape.type;
+        ints[rec + 1] = (int)floats.size();
+        ints[rec + 2] = -1;  // points_off
+        ints[rec + 3] = 0;   // num_points
+        ints[rec + 4] = -1;  // ctrl_off
+        ints[rec + 5] = 0;   // num_base_points
+        ints[rec + 6] = -1;  // thickness_off
+        ints[rec + 7] = -1;  // bvh_base
+        ints[rec + 8] = -1;  // cdf_off
+        ints[rec + 9] = -1;  // pid_off
+        ints[rec + 10] = 0;  // is_closed
+        ints[rec + 11] = 0;  // use_distance_approx
+        float a = 0, b = 0, c = 0, d = 0;
+        switch (shape.type) {
+            case ShapeType::Circle: {
+                const Circle *p = (const Circle *)shape.ptr;
+                a = p->radius; b = p->center.x; c = p->center.y;
+                break;
+            } case ShapeType::Ellipse: {
+                const Ellipse *p = (const Ellipse *)shape.ptr;
+                a = p->radius.x; b = p->radius.y; c = p->center.x; d = p->center.y;
+                break;
+            } case ShapeType::Rect: {
+                const Rect *p = (const Rect *)shape.ptr;
+                a = p->p_min.x; b = p->p_min.y; c = p->p_max.x; d = p->p_max.y;
+                break;
+            } case ShapeType::Path: {
+                // a..c stay 0; d = total boundary length (compute_shape_length),
+                // needed by the stroke sampler for cap_prob.
+                d = shapes_length[s];
+                break;
+            } default: {
+                assert(false);
+            }
+        }
+        push_f(shape.stroke_width);
+        push_f(a); push_f(b); push_f(c); push_f(d);
+        if (shape.type == ShapeType::Path) {
+            const Path *p = (const Path *)shape.ptr;
+            ints[rec + 2] = (int)floats.size();
+            for (int k = 0; k < 2 * p->num_points; k++) {
+                push_f(p->points[k]);
+            }
+            ints[rec + 3] = p->num_points;
+            ints[rec + 4] = (int)ints.size();
+            for (int j = 0; j < p->num_base_points; j++) {
+                push_i(p->num_control_points[j]);
+            }
+            ints[rec + 5] = p->num_base_points;
+            if (p->thickness != nullptr) {
+                ints[rec + 6] = (int)floats.size();
+                for (int k = 0; k < p->num_points; k++) {
+                    push_f(p->thickness[k]);
+                }
+            }
+            ints[rec + 7] = path_bvh_base[s];
+            write_nodes(path_bvhs[s], bvh_num_nodes(p->num_base_points), path_bvh_base[s]);
+            ints[rec + 8] = (int)floats.size();
+            for (int j = 0; j < p->num_base_points; j++) {
+                push_f(path_length_cdf[s][j]);
+            }
+            for (int j = 0; j < p->num_base_points; j++) {
+                push_f(path_length_pmf[s][j]);
+            }
+            ints[rec + 9] = (int)ints.size();
+            for (int j = 0; j < p->num_base_points; j++) {
+                push_i(path_point_id_map[s][j]);
+            }
+            ints[rec + 10] = p->is_closed ? 1 : 0;
+            ints[rec + 11] = p->use_distance_approx ? 1 : 0;
+        }
+    }
+
+    // Shape groups
+    auto push_color = [&](ColorType type, const void *color, int &type_out, int &off_out, int &nstops_out) {
+        if (color == nullptr) {
+            type_out = -1;
+            off_out = -1;
+            nstops_out = 0;
+            return;
+        }
+        type_out = (int)type;
+        off_out = (int)floats.size();
+        switch (type) {
+            case ColorType::Constant: {
+                const Constant *col = (const Constant *)color;
+                push_f(col->color.x); push_f(col->color.y);
+                push_f(col->color.z); push_f(col->color.w);
+                nstops_out = 0;
+                break;
+            } case ColorType::LinearGradient: {
+                const LinearGradient *col = (const LinearGradient *)color;
+                push_f(col->begin.x); push_f(col->begin.y);
+                push_f(col->end.x); push_f(col->end.y);
+                for (int k = 0; k < col->num_stops; k++) push_f(col->stop_offsets[k]);
+                for (int k = 0; k < 4 * col->num_stops; k++) push_f(col->stop_colors[k]);
+                nstops_out = col->num_stops;
+                break;
+            } case ColorType::RadialGradient: {
+                const RadialGradient *col = (const RadialGradient *)color;
+                push_f(col->center.x); push_f(col->center.y);
+                push_f(col->radius.x); push_f(col->radius.y);
+                for (int k = 0; k < col->num_stops; k++) push_f(col->stop_offsets[k]);
+                for (int k = 0; k < 4 * col->num_stops; k++) push_f(col->stop_colors[k]);
+                nstops_out = col->num_stops;
+                break;
+            } default: {
+                assert(false);
+            }
+        }
+    };
+    for (int g = 0; g < num_shape_groups; g++) {
+        const ShapeGroup &group = shape_groups[g];
+        int rec = ip[IP_GROUPS_I_OFF] + GROUP_I_STRIDE * g;
+        ints[rec + 0] = (int)ints.size();
+        for (int k = 0; k < group.num_shapes; k++) {
+            push_i(group.shape_ids[k]);
+        }
+        ints[rec + 1] = group.num_shapes;
+        push_color(group.fill_color_type, group.fill_color, ints[rec + 2], ints[rec + 3], ints[rec + 4]);
+        push_color(group.stroke_color_type, group.stroke_color, ints[rec + 5], ints[rec + 6], ints[rec + 7]);
+        ints[rec + 8] = group.use_even_odd_rule ? 1 : 0;
+        ints[rec + 9] = group_bvh_base[g];
+        ints[rec + 10] = (int)floats.size();
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) push_f(group.shape_to_canvas(i, j));
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) push_f(group.canvas_to_shape(i, j));
+        ints[rec + 11] = 0;
+    }
+
+    // Edge sampling tables
+    ip[IP_NUM_SHAPES] = num_shapes;
+    ip[IP_NUM_GROUPS] = num_shape_groups;
+    ip[IP_NUM_TOTAL_SHAPES] = num_total_shapes;
+    ip[IP_SAMPLE_SHAPE_ID_OFF] = (int)ints.size();
+    for (int k = 0; k < num_total_shapes; k++) push_i(sample_shape_id[k]);
+    ip[IP_SAMPLE_GROUP_ID_OFF] = (int)ints.size();
+    for (int k = 0; k < num_total_shapes; k++) push_i(sample_group_id[k]);
+    ip[IP_SAMPLE_CDF_OFF] = (int)floats.size();
+    for (int k = 0; k < num_total_shapes; k++) push_f(sample_shapes_cdf[k]);
+    ip[IP_SAMPLE_PMF_OFF] = (int)floats.size();
+    for (int k = 0; k < num_total_shapes; k++) push_f(sample_shapes_pmf[k]);
+
+    ip[IP_NUM_FLOATS] = (int)floats.size();
+    ip[IP_NUM_INTS] = (int)ints.size();
+    if ((int)floats.size() < MIN_POOL_SIZE) floats.resize(MIN_POOL_SIZE, 0.f);
+    if ((int)ints.size() < MIN_POOL_SIZE) ints.resize(MIN_POOL_SIZE, 0);
 }

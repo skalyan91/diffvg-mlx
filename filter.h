@@ -47,6 +47,48 @@ float compute_filter_weight(const Filter &filter,
     }
 }
 
+// d compute_filter_weight / d radius (zero outside the closed support, where
+// the weight is identically zero; the jump of the box filter at the support
+// border is not differentiated).
+DEVICE
+inline
+float filter_weight_d_radius(const Filter &filter,
+                             float dx,
+                             float dy) {
+    auto r = filter.radius;
+    if (fabs(dx) > r || fabs(dy) > r) {
+        return 0;
+    }
+    if (filter.type == FilterType::Box) {
+        // w = 1 / (2r)^2
+        return -2 / cubic(2 * r) * 2;
+    } else if (filter.type == FilterType::Tent) {
+        // w = fx * fy / r^4, fx = r - |dx|, fy = r - |dy|
+        auto fx = r - fabs(dx);
+        auto fy = r - fabs(dy);
+        auto r4 = square(square(r));
+        return (fx + fy) / r4 - 4 * fx * fy / (r4 * r);
+    } else if (filter.type == FilterType::RadialParabolic) {
+        // w = (4/3)^2 * gx * gy, gx = 1 - (dx/r)^2
+        auto gx = 1 - square(dx / r);
+        auto gy = 1 - square(dy / r);
+        auto r3 = r * r * r;
+        auto d_gx = 2 * square(dx) / r3;
+        auto d_gy = 2 * square(dy) / r3;
+        return (16.f / 9.f) * (d_gx * gy + gx * d_gy);
+    } else {
+        assert(filter.type == FilterType::Hann);
+        // w = hx * hy / r^2, hx = 0.5 * (1 - cos(2 pi ndx)), ndx = dx / (2r) + 0.5
+        auto ndx = (dx / (2*r)) + 0.5f;
+        auto ndy = (dy / (2*r)) + 0.5f;
+        auto hx = 0.5f * (1.f - cos(float(2*M_PI) * ndx));
+        auto hy = 0.5f * (1.f - cos(float(2*M_PI) * ndy));
+        auto d_hx = 0.5f * sin(float(2*M_PI) * ndx) * float(2*M_PI) * (-dx / (2 * r * r));
+        auto d_hy = 0.5f * sin(float(2*M_PI) * ndy) * float(2*M_PI) * (-dy / (2 * r * r));
+        return (d_hx * hy + hx * d_hy) / square(r) - 2 * hx * hy / cubic(r);
+    }
+}
+
 DEVICE
 inline
 void d_compute_filter_weight(const Filter &filter,
@@ -54,53 +96,5 @@ void d_compute_filter_weight(const Filter &filter,
                              float dy,
                              float d_return,
                              DFilter *d_filter) {
-    if (filter.type == FilterType::Box) {
-        // return 1.f / square(2 * filter.radius);
-        atomic_add(d_filter->radius,
-            d_return * (-2) * 2 * filter.radius / cubic(2 * filter.radius));
-    } else if (filter.type == FilterType::Tent) {
-        // return (filer.radius - fabs(dx)) * (filer.radius - fabs(dy)) /
-        //        square(square(filter.radius));
-        auto fx = filter.radius - fabs(dx);
-        auto fy = filter.radius - fabs(dy);
-        auto norm = 1 / square(filter.radius);
-        auto d_fx = d_return * fy * norm;
-        auto d_fy = d_return * fx * norm;
-        auto d_norm = d_return * fx * fy;
-        atomic_add(d_filter->radius,
-            d_fx + d_fy + (-4) * d_norm / pow(filter.radius, 5));
-    } else if (filter.type == FilterType::RadialParabolic) {
-        // return (4.f / 3.f) * (1 - square(dx / filter.radius)) *
-        //        (4.f / 3.f) * (1 - square(dy / filter.radius));
-        // auto d_square_x = d_return * (-4.f / 3.f);
-        // auto d_square_y = d_return * (-4.f / 3.f);
-        auto r3 = filter.radius * filter.radius * filter.radius;
-        auto d_radius = -(2 * square(dx) + 2 * square(dy)) / r3;
-        atomic_add(d_filter->radius, d_radius);
-    } else {
-        assert(filter.type == FilterType::Hann);
-        // // normalize dx, dy to [0, 1]
-        // auto ndx = (dx / (2*filter.radius)) + 0.5f;
-        // auto ndy = (dy / (2*filter.radius)) + 0.5f;
-        // // the normalization factor is R^2
-        // return 0.5f * (1.f - cos(float(2 * M_PI) * ndx)) *
-        //        0.5f * (1.f - cos(float(2 * M_PI) * ndy)) /
-        //        square(filter.radius);
-
-        // normalize dx, dy to [0, 1]
-        auto ndx = (dx / (2*filter.radius)) + 0.5f;
-        auto ndy = (dy / (2*filter.radius)) + 0.5f;
-        auto fx = 0.5f * (1.f - cos(float(2*M_PI) * ndx));
-        auto fy = 0.5f * (1.f - cos(float(2*M_PI) * ndy));
-        auto norm = 1 / square(filter.radius);
-        auto d_fx = d_return * fy * norm;
-        auto d_fy = d_return * fx * norm;
-        auto d_norm = d_return * fx * fy;
-        auto d_ndx = d_fx * 0.5f * sin(float(2*M_PI) * ndx) * float(2*M_PI);
-        auto d_ndy = d_fy * 0.5f * sin(float(2*M_PI) * ndy) * float(2*M_PI);
-        atomic_add(d_filter->radius,
-            d_ndx * (-2*dx / square(2*filter.radius)) +
-            d_ndy * (-2*dy / square(2*filter.radius)) +
-            (-2) * d_norm / cubic(filter.radius));
-    }
+    atomic_add(d_filter->radius, d_return * filter_weight_d_radius(filter, dx, dy));
 }

@@ -113,6 +113,263 @@ bool closest_point(const Ellipse &ellipse, const Vector2f &pt,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Robust real roots on [0, 1] of polynomials of degree <= 5 in Bernstein form
+// (double precision port of the Metal backend's bpoly_* helpers).
+// Roots are isolated by de Casteljau subdivision with Descartes' rule of signs
+// for Bernstein coefficients (the number of roots in the interval is at most the
+// number of coefficient sign changes, with the same parity): 0 changes -> no
+// root, 1 change -> exactly one simple root (refined by safeguarded Newton),
+// >= 2 -> split at the midpoint (depth limited). Unlike the former power-basis
+// solver this never divides by the leading coefficient.
+struct BernsteinPoly {
+    double c[6];
+    int n;
+};
+
+// Value and derivative (w.r.t. t on the polynomial's own [0, 1]).
+DEVICE
+inline
+double bernstein_eval(const BernsteinPoly &p, double t, double *d) {
+    double b[6];
+    for (int i = 0; i <= p.n; i++) {
+        b[i] = p.c[i];
+    }
+    double s = 1 - t;
+    for (int k = p.n; k > 1; k--) {
+        for (int i = 0; i < k; i++) {
+            b[i] = s * b[i] + t * b[i + 1];
+        }
+    }
+    if (p.n >= 1) {
+        *d = double(p.n) * (b[1] - b[0]);
+        return s * b[0] + t * b[1];
+    }
+    *d = 0;
+    return b[0];
+}
+
+DEVICE
+inline
+void bernstein_split(const BernsteinPoly &p, BernsteinPoly *left, BernsteinPoly *right) {
+    double b[6];
+    for (int i = 0; i <= p.n; i++) {
+        b[i] = p.c[i];
+    }
+    left->n = p.n;
+    right->n = p.n;
+    left->c[0] = b[0];
+    right->c[p.n] = b[p.n];
+    for (int k = 1; k <= p.n; k++) {
+        for (int i = 0; i <= p.n - k; i++) {
+            b[i] = 0.5 * (b[i] + b[i + 1]);
+        }
+        left->c[k] = b[0];
+        right->c[p.n - k] = b[p.n - k];
+    }
+}
+
+// Number of sign changes of the nonzero coefficients; *first = first nonzero
+// coefficient (its sign is the sign of p just right of 0).
+DEVICE
+inline
+int bernstein_sign_changes(const BernsteinPoly &p, double *first) {
+    int changes = 0;
+    double f = 0, last = 0;
+    for (int i = 0; i <= p.n; i++) {
+        double v = p.c[i];
+        if (v != 0) {
+            if (last != 0 && (v < 0) != (last < 0)) {
+                changes++;
+            }
+            if (f == 0) {
+                f = v;
+            }
+            last = v;
+        }
+    }
+    *first = f;
+    return changes;
+}
+
+// The unique simple root in (0, 1) of p (exactly one coefficient sign change).
+DEVICE
+inline
+double bernstein_refine01(const BernsteinPoly &p, double first) {
+    bool neg_lo = first < 0;
+    double lo = 0, hi = 1;
+    double f0 = p.c[0], f1 = p.c[p.n];
+    double u = 0.5;
+    if (f0 != 0 && f1 != 0 && (f0 < 0) != (f1 < 0)) {
+        // regula falsi start
+        u = f0 / (f0 - f1);
+        u = u < 0 ? 0 : (u > 1 ? 1 : u);
+    }
+    for (int it = 0; it < 60; it++) {
+        double du = 0;
+        double fu = bernstein_eval(p, u, &du);
+        if (fu == 0) {
+            break;
+        }
+        if ((fu < 0) == neg_lo) {
+            lo = u;
+        } else {
+            hi = u;
+        }
+        double mid = 0.5 * (lo + hi);
+        double un = mid;
+        if (du != 0) {
+            double nt = u - fu / du;
+            if (nt > lo && nt < hi) {
+                un = nt;
+            }
+        }
+        if (fabs(un - u) < 1e-15 || !(mid > lo && mid < hi)) {
+            u = un;
+            break;
+        }
+        u = un;
+    }
+    return u;
+}
+
+// Roots of p in [0, 1] (unordered, at most 5) written to roots; returns the count.
+// A root exactly at a subdivision point or at t = 0 / 1 is reported once. At the
+// depth limit (roots closer than 2^-40) the interval midpoint is reported. An
+// identically zero polynomial has no roots.
+DEVICE
+inline
+int bernstein_roots01(const BernsteinPoly &p, double *roots) {
+    int num_roots = 0;
+    if (p.n <= 0) {
+        return 0;
+    }
+    if (p.c[p.n] == 0) {
+        bool all_zero = true;
+        for (int i = 0; i <= p.n; i++) {
+            if (p.c[i] != 0) {
+                all_zero = false;
+            }
+        }
+        if (all_zero) {
+            return 0;
+        }
+        roots[num_roots++] = 1;
+    }
+    struct Entry {
+        BernsteinPoly p;
+        double l, r;
+        int depth;
+        bool own_left; // report a root exactly at l (false for left children: shared with the parent)
+    };
+    constexpr int max_stack = 64;
+    constexpr int max_depth = 40;
+    Entry stack[max_stack];
+    int sp = 0;
+    stack[sp++] = Entry{p, 0, 1, 0, true};
+    while (sp > 0 && num_roots < 5) {
+        Entry e = stack[--sp];
+        if (e.own_left && e.p.c[0] == 0) {
+            roots[num_roots++] = e.l;
+            if (num_roots >= 5) {
+                break;
+            }
+        }
+        double first = 0;
+        int changes = bernstein_sign_changes(e.p, &first);
+        if (changes == 0) {
+            continue;
+        }
+        if (changes == 1) {
+            double u = bernstein_refine01(e.p, first);
+            roots[num_roots++] = e.l + u * (e.r - e.l);
+            continue;
+        }
+        double m = 0.5 * (e.l + e.r);
+        if (e.depth >= max_depth || !(m > e.l && m < e.r) || sp + 2 > max_stack) {
+            roots[num_roots++] = m;
+            continue;
+        }
+        BernsteinPoly left, right;
+        bernstein_split(e.p, &left, &right);
+        // push right first so that the left half is processed first
+        stack[sp++] = Entry{right, m, e.r, e.depth + 1, true};
+        stack[sp++] = Entry{left, e.l, m, e.depth + 1, false};
+    }
+    return num_roots;
+}
+
+// Roots in [0, 1] of (q(t) - pt) . q'(t) for the cubic Bezier q with control
+// points p0..p3 (the stationary points of the distance to pt). The quintic is
+// formed in Bernstein form in a frame translated to pt and scaled by the
+// control-point extent, so it is well conditioned and never normalised by its
+// leading coefficient (which vanishes e.g. for a degree-elevated line).
+DEVICE
+inline
+int cubic_closest_roots(const Vector2f &p0, const Vector2f &p1,
+                        const Vector2f &p2, const Vector2f &p3,
+                        const Vector2f &pt, double *roots) {
+    double X[4] = {double(p0.x) - double(pt.x), double(p1.x) - double(pt.x),
+                   double(p2.x) - double(pt.x), double(p3.x) - double(pt.x)};
+    double Y[4] = {double(p0.y) - double(pt.y), double(p1.y) - double(pt.y),
+                   double(p2.y) - double(pt.y), double(p3.y) - double(pt.y)};
+    double S = 0;
+    for (int i = 0; i < 4; i++) {
+        S = fabs(X[i]) > S ? fabs(X[i]) : S;
+        S = fabs(Y[i]) > S ? fabs(Y[i]) : S;
+    }
+    if (!(S > 0)) {
+        return 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        X[i] /= S;
+        Y[i] /= S;
+    }
+    // q' in Bernstein form (degree 2), without the factor 3 (roots unchanged)
+    double DX[3] = {X[1] - X[0], X[2] - X[1], X[3] - X[2]};
+    double DY[3] = {Y[1] - Y[0], Y[2] - Y[1], Y[3] - Y[2]};
+    auto pd = [&](int i, int j) { return X[i] * DX[j] + Y[i] * DY[j]; };
+    // product of Bernstein polynomials:
+    // c_k = sum_{i+j=k} C(3,i) C(2,j) / C(5,k) P_i . D_j
+    BernsteinPoly g;
+    g.n = 5;
+    g.c[0] = pd(0, 0);
+    g.c[1] = (2 * pd(0, 1) + 3 * pd(1, 0)) / 5;
+    g.c[2] = (pd(0, 2) + 6 * pd(1, 1) + 3 * pd(2, 0)) / 10;
+    g.c[3] = (3 * pd(1, 2) + 6 * pd(2, 1) + pd(3, 0)) / 10;
+    g.c[4] = (3 * pd(2, 2) + 2 * pd(3, 1)) / 5;
+    g.c[5] = pd(3, 2);
+    return bernstein_roots01(g, roots);
+}
+
+DEVICE
+inline
+float point_to_segment_distance(const Vector2f &p, const Vector2f &a, const Vector2f &b) {
+    auto ab = b - a;
+    auto ll = dot(ab, ab);
+    auto t = ll > 0 ? dot(p - a, ab) / ll : 0.f;
+    t = t < 0 ? 0.f : (t > 1 ? 1.f : t);
+    return distance(p, a + t * ab);
+}
+
+// Lower bound on the distance from pt to a cubic Bezier: the curve lies in the
+// convex hull of its control points, which lies in the capsule of radius
+// h = max(dist(p1, p0p3), dist(p2, p0p3)) around the chord p0p3. A relative
+// tolerance is subtracted to absorb float rounding, so skipping the root search
+// when the bound exceeds the current best distance cannot change the result.
+DEVICE
+inline
+float cubic_distance_lower_bound(const Vector2f &p0, const Vector2f &p1,
+                                 const Vector2f &p2, const Vector2f &p3,
+                                 const Vector2f &pt) {
+    auto h = max(point_to_segment_distance(p1, p0, p3), point_to_segment_distance(p2, p0, p3));
+    auto m = 0.f;
+    for (const Vector2f &q : {p0 - pt, p1 - pt, p2 - pt, p3 - pt}) {
+        m = max(m, max(fabs(q.x), fabs(q.y)));
+    }
+    return point_to_segment_distance(pt, p0, p3) - h - 1e-5f * (1 + m);
+}
+
 DEVICE
 inline
 bool closest_point(const Path &path, const BVHNode *bvh_nodes, const Vector2f &pt, float max_radius,
@@ -144,7 +401,9 @@ bool closest_point(const Path &path, const BVHNode *bvh_nodes, const Vector2f &p
                 auto p0 = Vector2f{path.points[2 * i0], path.points[2 * i0 + 1]};
                 auto p1 = Vector2f{path.points[2 * i1], path.points[2 * i1 + 1]};
                 // project pt to line
-                auto t = dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0);
+                // zero-length segment: 0/0 = NaN would skip every branch below with a NaN
+                // distance; treat it as the point p0 (as geometry.metal does)
+                auto t = dot(p1 - p0, p1 - p0) > 0 ? dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0) : -1.f;
                 if (t < 0) {
                     dist = distance(p0, pt);
                     closest_pt = p0;
@@ -242,131 +501,23 @@ bool closest_point(const Path &path, const BVHNode *bvh_nodes, const Vector2f &p
                     closest_pt = pt1;
                     t_root = 1;
                 }
-                // The curve is (1 - t)^3 p0 + 3 * (1 - t)^2 t p1 + 3 * (1 - t) t^2 p2 + t^3 p3
-                // = (-p0+3p1-3p2+p3) t^3 + (3p0-6p1+3p2) t^2 + (-3p0+3p1) t + p0
-                // Want to solve (q - pt) dot q' = 0
-                // q' = 3*(-p0+3p1-3p2+p3)t^2 + 2*(3p0-6p1+3p2)t + (-3p0+3p1)
-                // Expanding 
-                // 3*(-p0+3p1-3p2+p3)^2 t^5
-                // 5*(-p0+3p1-3p2+p3)(3p0-6p1+3p2) t^4
-                // 4*(-p0+3p1-3p2+p3)(-3p0+3p1) + 2*(3p0-6p1+3p2)^2 t^3
-                // 3*(3p0-6p1+3p2)(-3p0+3p1) + 3*(-p0+3p1-3p2+p3)(p0-pt) t^2
-                // (-3p0+3p1)^2+2(p0-pt)(3p0-6p1+3p2) t
-                // (p0-pt)(-3p0+3p1)
-                double A = 3*sum((-p0+3*p1-3*p2+p3)*(-p0+3*p1-3*p2+p3));
-                double B = 5*sum((-p0+3*p1-3*p2+p3)*(3*p0-6*p1+3*p2));
-                double C = 4*sum((-p0+3*p1-3*p2+p3)*(-3*p0+3*p1)) + 2*sum((3*p0-6*p1+3*p2)*(3*p0-6*p1+3*p2));
-                double D = 3*(sum((3*p0-6*p1+3*p2)*(-3*p0+3*p1)) + sum((-p0+3*p1-3*p2+p3)*(p0-pt)));
-                double E = sum((-3*p0+3*p1)*(-3*p0+3*p1)) + 2*sum((p0-pt)*(3*p0-6*p1+3*p2));
-                double F = sum((p0-pt)*(-3*p0+3*p1));
-                // normalize the polynomial
-                B /= A;
-                C /= A;
-                D /= A;
-                E /= A;
-                F /= A;
-                // Isolator Polynomials:
-                // https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.133.2233&rep=rep1&type=pdf
-                //                                       x/5 + B/25
-                //                                    /-----------------------------------------------------
-                // 5x^4 + 4B x^3 + 3C x^2 + 2D x + E /   x^5 +    B x^4 +       C x^3 +      D x^2 +      E x + F
-                //                                       x^5 + 4B/5 x^4 +    3C/5 x^3 +   2D/5 x^2 +    E/5 x
-                //                                      ----------------------------------------------------
-                //                                              B/5 x^4 +    2C/5 x^3 +   3D/5 x^2 +   4E/5 x + F
-                //                                              B/5 x^4 + 4B^2/25 x^3 + 3BC/25 x^2 + 2BD/25 x + BE/25
-                //                                      ----------------------------------------------------
-                //                                     (2C/5 - 4B^2/25)x^3 + (3D/5-3BC/25)x^2 + (4E/5-2BD/25) + (F-BE/25)
-                auto p1A = ((2 / 5.f) * C - (4 / 25.f) * B * B);
-                auto p1B = ((3 / 5.f) * D - (3 / 25.f) * B * C);
-                auto p1C = ((4 / 5.f) * E - (2 / 25.f) * B * D);
-                auto p1D = F - B * E / 25.f;
-                // auto q1A = 1 / 5.f;
-                // auto q1B = B / 25.f;
-                // x/5 + B/25 = 0
-                // x = -B/5
-                auto q_root = -B/5.f;
-                double p_roots[3];
-                int num_sol = solve_cubic(p1A, p1B, p1C, p1D, p_roots);
-                float intervals[4];
-                if (q_root >= 0 && q_root <= 1) {
-                    intervals[0] = q_root;
-                }
-                for (int j = 0; j < num_sol; j++) {
-                    intervals[j + 1] = p_roots[j];
-                }
-                auto num_intervals = 1 + num_sol;
-                // sort intervals
-                for (int j = 1; j < num_intervals; j++) {
-                    for (int k = j; k > 0 && intervals[k - 1] > intervals[k]; k--) {
-                        auto tmp = intervals[k];
-                        intervals[k] = intervals[k - 1];
-                        intervals[k - 1] = tmp;
-                    }
-                }
-                auto eval_polynomial = [&] (double t) {
-                    return t*t*t*t*t+
-                           B*t*t*t*t+
-                           C*t*t*t+
-                           D*t*t+
-                           E*t+
-                           F;
-                };
-                auto eval_polynomial_deriv = [&] (double t) {
-                    return 5*t*t*t*t+
-                           4*B*t*t*t+
-                           3*C*t*t+
-                           2*D*t+
-                           E;
-                };
-                auto lower_bound = 0.f;
-                for (int j = 0; j < num_intervals + 1; j++) {
-                    if (j < num_intervals && intervals[j] < 0.f) {
-                        continue;
-                    }
-                    auto upper_bound = j < num_intervals ?
-                        min(intervals[j], 1.f) : 1.f;
-                    auto lb = lower_bound;
-                    auto ub = upper_bound;
-                    auto lb_eval = eval_polynomial(lb);
-                    auto ub_eval = eval_polynomial(ub);
-                    if (lb_eval * ub_eval > 0) {
-                        // Doesn't have root
-                        continue;
-                    }
-                    if (lb_eval > ub_eval) {
-                        swap_(lb, ub);
-                    }
-                    auto t = 0.5f * (lb + ub);
-                    auto num_iter = 20;
-                    for (int it = 0; it < num_iter; it++) {
-                        if (!(t >= lb && t <= ub)) {
-                            t = 0.5f * (lb + ub);
+                // Stationary points of the distance: roots in [0, 1] of the quintic
+                // (q(t) - pt) . q'(t), found robustly in Bernstein form (see
+                // cubic_closest_roots). Skip the search when the convex-hull
+                // capsule is farther than the best distance found so far.
+                if (cubic_distance_lower_bound(p0, p1, p2, p3, pt) < min(dist, min_dist)) {
+                    double roots[5];
+                    int num_roots = cubic_closest_roots(p0, p1, p2, p3, pt, roots);
+                    for (int j = 0; j < num_roots; j++) {
+                        auto t = float(roots[j]);
+                        auto p = eval(t);
+                        auto distp = distance(p, pt);
+                        if (distp < dist) {
+                            dist = distp;
+                            closest_pt = p;
+                            t_root = t;
                         }
-                        auto value = eval_polynomial(t);
-                        if (fabs(value) < 1e-5f || it == num_iter - 1) {
-                            break;
-                        }
-                        // The derivative may not be entirely accurate,
-                        // but the bisection is going to handle this
-                        if (value > 0.f) {
-                            ub = t;
-                        } else {
-                            lb = t;
-                        }
-                        auto derivative = eval_polynomial_deriv(t);
-                        t -= value / derivative;
                     }
-                    auto p = eval(t);
-                    auto distp = distance(p, pt);
-                    if (distp < dist) {
-                        dist = distp;
-                        closest_pt = p;
-                        t_root = t;
-                    }
-                    if (upper_bound >= 1.f) {
-                        break;
-                    }
-                    lower_bound = upper_bound;
                 }
             } else {
                 assert(false);
@@ -407,7 +558,9 @@ bool closest_point(const Rect &rect, const Vector2f &pt,
     auto closest_pt = Vector2f{0, 0};
     auto update = [&](const Vector2f &p0, const Vector2f &p1, bool first) {
         // project pt to line
-        auto t = dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0);
+        // zero-length segment: 0/0 = NaN would skip every branch below with a NaN
+        // distance; treat it as the point p0 (as geometry.metal does)
+        auto t = dot(p1 - p0, p1 - p0) > 0 ? dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0) : -1.f;
         if (t < 0) {
             auto d = distance(p0, pt);
             if (first || d < min_dist) {
@@ -618,311 +771,112 @@ void d_closest_point(const Path &path,
                      const Vector2f &d_closest_pt,
                      const ClosestPointPathInfo &path_info,
                      Path &d_path,
-                     Vector2f &d_pt) {
+                     Vector2f &d_pt,
+                     float d_t_root = 0) {
     auto base_point_id = path_info.base_point_id;
     auto point_id = path_info.point_id;
     auto min_t_root = path_info.t_root;
     
-    if (path.num_control_points[base_point_id] == 0) {
+    if (base_point_id < 0) {
+        return;
+    }
+    auto ncp = path.num_control_points[base_point_id];
+    assert(ncp >= 0 && ncp <= 2);
+    // Segment of degree n with control points p_i = points[idx[i]] and closest
+    // point q(t) = sum_i B_i(t) p_i (Bernstein basis).
+    //  * Lines: q is the clamped projection p0 + t (p1 - p0),
+    //    t = (pt - p0).(p1 - p0) / |p1 - p0|^2; the dt/dp0, dt/dp1, dt/dpt terms are
+    //    included (they cancel only under conformal shape_to_canvas).
+    //  * Curves with interior t: t solves G(t) = (q(t) - pt) . q'(t) = 0, so by the
+    //    implicit function theorem dt/dtheta = -(dG/dtheta) / G'(t) with
+    //    G'(t) = q'.q' + (q - pt).q'', dG/dp_i = B_i q' + B'_i (q - pt), dG/dpt = -q'.
+    //    The t term is skipped when |G'| <= 1e-6 (|q'|^2 + |q - pt| |q''|).
+    //  * t == 0 or t == 1: end point, no t dependence.
+    // (Replaces per-degree power-basis code that discarded the quadratic point
+    // gradients, dropped the line dt terms and divided by the cubic leading
+    // coefficient.)
+    int n = ncp + 1;
+    int idx[4] = {0, 0, 0, 0};
+    Vector2f P[4] = {Vector2f{0, 0}, Vector2f{0, 0}, Vector2f{0, 0}, Vector2f{0, 0}};
+    for (int i = 0; i <= n; i++) {
+        idx[i] = i == n ? (point_id + i) % path.num_points : point_id + i;
+        // control points relative to pt
+        P[i] = Vector2f{path.points[2 * idx[i]], path.points[2 * idx[i] + 1]} - pt;
+    }
+    Vector2f d_P[4] = {Vector2f{0, 0}, Vector2f{0, 0}, Vector2f{0, 0}, Vector2f{0, 0}};
+    if (n == 1) {
         // Straight line
-        auto i0 = point_id;
-        auto i1 = (point_id + 1) % path.num_points;
-        auto p0 = Vector2f{path.points[2 * i0], path.points[2 * i0 + 1]};
-        auto p1 = Vector2f{path.points[2 * i1], path.points[2 * i1 + 1]};
-        // project pt to line
-        auto t = dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0);
-        auto d_p0 = Vector2f{0, 0};
-        auto d_p1 = Vector2f{0, 0};
+        auto p0 = Vector2f{path.points[2 * idx[0]], path.points[2 * idx[0] + 1]};
+        auto p1 = Vector2f{path.points[2 * idx[1]], path.points[2 * idx[1] + 1]};
+        auto e = p1 - p0;
+        auto ll = dot(e, e);
+        auto t = ll > 0 ? dot(pt - p0, e) / ll : -1.f;
         if (t < 0) {
-            d_p0 += d_closest_pt;
+            d_P[0] += d_closest_pt;
         } else if (t > 1) {
-            d_p1 += d_closest_pt;
+            d_P[1] += d_closest_pt;
         } else {
-            auto d_p = d_closest_pt;
-            // p = p0 + t * (p1 - p0)
-            d_p0 += d_p * (1 - t);
-            d_p1 += d_p * t;
+            // q = p0 + t (p1 - p0)
+            d_P[0] += d_closest_pt * (1 - t);
+            d_P[1] += d_closest_pt * t;
+            // t = num / den, num = (pt - p0).(p1 - p0), den = (p1 - p0).(p1 - p0)
+            auto d_t = dot(d_closest_pt, e) + d_t_root;
+            auto d_num = d_t / ll;
+            auto d_den = -d_t * t / ll;
+            d_pt += e * d_num;
+            d_P[1] += (pt - p0) * d_num;
+            d_P[0] += ((p0 - p1) + (p0 - pt)) * d_num;
+            d_P[1] += e * (2 * d_den);
+            d_P[0] += e * (-2 * d_den);
         }
-        atomic_add(d_path.points + 2 * i0, d_p0);
-        atomic_add(d_path.points + 2 * i1, d_p1);
-    } else if (path.num_control_points[base_point_id] == 1) {
-        // Quadratic Bezier curve
-        auto i0 = point_id;
-        auto i1 = point_id + 1;
-        auto i2 = (point_id + 2) % path.num_points;
-        auto p0 = Vector2f{path.points[2 * i0], path.points[2 * i0 + 1]};
-        auto p1 = Vector2f{path.points[2 * i1], path.points[2 * i1 + 1]};
-        auto p2 = Vector2f{path.points[2 * i2], path.points[2 * i2 + 1]};
-        // auto eval = [&](float t) -> Vector2f {
-        //     auto tt = 1 - t;
-        //     return (tt*tt)*p0 + (2*tt*t)*p1 + (t*t)*p2;
-        // };
-        // auto dist0 = distance(eval(0), pt);
-        // auto dist1 = distance(eval(1), pt);
-        auto d_p0 = Vector2f{0, 0};
-        auto d_p1 = Vector2f{0, 0};
-        auto d_p2 = Vector2f{0, 0};
-        auto t = min_t_root;
-        if (t == 0) {
-            d_p0 += d_closest_pt;
-        } else if (t == 1) {
-            d_p2 += d_closest_pt;
-        } else {
-            // The curve is (1-t)^2p0 + 2(1-t)tp1 + t^2p2
-            // = (p0-2p1+p2)t^2+(-2p0+2p1)t+p0 = q
-            // Want to solve (q - pt) dot q' = 0
-            // q' = (p0-2p1+p2)t + (-p0+p1)
-            // Expanding (p0-2p1+p2)^2 t^3 +
-            //           3(p0-2p1+p2)(-p0+p1) t^2 +
-            //           (2(-p0+p1)^2+(p0-2p1+p2)(p0-pt))t +
-            //           (-p0+p1)(p0-pt) = 0
-            auto A = sum((p0-2*p1+p2)*(p0-2*p1+p2));
-            auto B = sum(3*(p0-2*p1+p2)*(-p0+p1));
-            auto C = sum(2*(-p0+p1)*(-p0+p1)+(p0-2*p1+p2)*(p0-pt));
-            // auto D = sum((-p0+p1)*(p0-pt));
-            auto d_p = d_closest_pt;
-            // p = eval(t)
-            auto tt = 1 - t;
-            // (tt*tt)*p0 + (2*tt*t)*p1 + (t*t)*p2
-            auto d_tt = 2 * tt * dot(d_p, p0) + 2 * t * dot(d_p, p1);
-            auto d_t = -d_tt + 2 * tt * dot(d_p, p1) + 2 * t * dot(d_p, p2);
-            auto d_p0 = d_p * tt * tt;
-            auto d_p1 = 2 * d_p * tt * t;
-            auto d_p2 = d_p * t * t;
-            // implicit function theorem: dt/dA = -1/(p'(t)) * dp/dA
-            auto poly_deriv_t = 3 * A * t * t + 2 * B * t + C;
-            if (fabs(poly_deriv_t) > 1e-6f) {
-                auto d_A = - (d_t / poly_deriv_t) * t * t * t;
-                auto d_B = - (d_t / poly_deriv_t) * t * t;
-                auto d_C = - (d_t / poly_deriv_t) * t;
-                auto d_D = - (d_t / poly_deriv_t);
-                // A = sum((p0-2*p1+p2)*(p0-2*p1+p2))
-                // B = sum(3*(p0-2*p1+p2)*(-p0+p1))
-                // C = sum(2*(-p0+p1)*(-p0+p1)+(p0-2*p1+p2)*(p0-pt))
-                // D = sum((-p0+p1)*(p0-pt))
-                d_p0 += 2*d_A*(p0-2*p1+p2)+
-                        3*d_B*((-p0+p1)-(p0-2*p1+p2))+
-                        2*d_C*(-2*(-p0+p1))+
-                          d_C*((p0-pt)+(p0-2*p1+p2))+
-                        2*d_D*(-(p0-pt)+(-p0+p1));
-                d_p1 += (-2)*2*d_A*(p0-2*p1+p2)+
-                        3*d_B*(-2*(-p0+p1)+(p0-2*p1+p2))+
-                        2*d_C*(2*(-p0+p1))+
-                          d_C*((-2)*(p0-pt))+
-                        d_D*(p0-pt);
-                d_p2 += 2*d_A*(p0-2*p1+p2)+
-                        3*d_B*(-p0+p1)+
-                        d_C*(p0-pt);
-                d_pt += d_C*(-(p0-2*p1+p2))+
-                        d_D*(-(-p0+p1));
-            }
-        }
-        atomic_add(d_path.points + 2 * i0, d_p0);
-        atomic_add(d_path.points + 2 * i1, d_p1);
-        atomic_add(d_path.points + 2 * i2, d_p2);
-    } else if (path.num_control_points[base_point_id] == 2) {
-        // Cubic Bezier curve
-        auto i0 = point_id;
-        auto i1 = point_id + 1;
-        auto i2 = point_id + 2;
-        auto i3 = (point_id + 3) % path.num_points;
-        auto p0 = Vector2f{path.points[2 * i0], path.points[2 * i0 + 1]};
-        auto p1 = Vector2f{path.points[2 * i1], path.points[2 * i1 + 1]};
-        auto p2 = Vector2f{path.points[2 * i2], path.points[2 * i2 + 1]};
-        auto p3 = Vector2f{path.points[2 * i3], path.points[2 * i3 + 1]};
-        // auto eval = [&](float t) -> Vector2f {
-        //     auto tt = 1 - t;
-        //     return (tt*tt*tt)*p0 + (3*tt*tt*t)*p1 + (3*tt*t*t)*p2 + (t*t*t)*p3;
-        // };
-        auto d_p0 = Vector2f{0, 0};
-        auto d_p1 = Vector2f{0, 0};
-        auto d_p2 = Vector2f{0, 0};
-        auto d_p3 = Vector2f{0, 0};
-        auto t = min_t_root;
-        if (t == 0) {
-            // closest_pt = p0
-            d_p0 += d_closest_pt;
-        } else if (t == 1) {
-            // closest_pt = p1
-            d_p3 += d_closest_pt;
-        } else {
-            // The curve is (1 - t)^3 p0 + 3 * (1 - t)^2 t p1 + 3 * (1 - t) t^2 p2 + t^3 p3
-            // = (-p0+3p1-3p2+p3) t^3 + (3p0-6p1+3p2) t^2 + (-3p0+3p1) t + p0
-            // Want to solve (q - pt) dot q' = 0
-            // q' = 3*(-p0+3p1-3p2+p3)t^2 + 2*(3p0-6p1+3p2)t + (-3p0+3p1)
-            // Expanding 
-            // 3*(-p0+3p1-3p2+p3)^2 t^5
-            // 5*(-p0+3p1-3p2+p3)(3p0-6p1+3p2) t^4
-            // 4*(-p0+3p1-3p2+p3)(-3p0+3p1) + 2*(3p0-6p1+3p2)^2 t^3
-            // 3*(3p0-6p1+3p2)(-3p0+3p1) + 3*(-p0+3p1-3p2+p3)(p0-pt) t^2
-            // (-3p0+3p1)^2+2(p0-pt)(3p0-6p1+3p2) t
-            // (p0-pt)(-3p0+3p1)
-            double A = 3*sum((-p0+3*p1-3*p2+p3)*(-p0+3*p1-3*p2+p3));
-            double B = 5*sum((-p0+3*p1-3*p2+p3)*(3*p0-6*p1+3*p2));
-            double C = 4*sum((-p0+3*p1-3*p2+p3)*(-3*p0+3*p1)) + 2*sum((3*p0-6*p1+3*p2)*(3*p0-6*p1+3*p2));
-            double D = 3*(sum((3*p0-6*p1+3*p2)*(-3*p0+3*p1)) + sum((-p0+3*p1-3*p2+p3)*(p0-pt)));
-            double E = sum((-3*p0+3*p1)*(-3*p0+3*p1)) + 2*sum((p0-pt)*(3*p0-6*p1+3*p2));
-            double F = sum((p0-pt)*(-3*p0+3*p1));
-            B /= A;
-            C /= A;
-            D /= A;
-            E /= A;
-            F /= A;
-            // auto eval_polynomial = [&] (double t) {
-            //     return t*t*t*t*t+
-            //            B*t*t*t*t+
-            //            C*t*t*t+
-            //            D*t*t+
-            //            E*t+
-            //            F;
-            // };
-            auto eval_polynomial_deriv = [&] (double t) {
-                return 5*t*t*t*t+
-                       4*B*t*t*t+
-                       3*C*t*t+
-                       2*D*t+
-                       E;
-            };
-
-            // auto p = eval(t);
-            auto d_p = d_closest_pt;
-            // (tt*tt*tt)*p0 + (3*tt*tt*t)*p1 + (3*tt*t*t)*p2 + (t*t*t)*p3
-            auto tt = 1 - t;
-            auto d_tt = 3 * tt * tt * dot(d_p, p0) +
-                        6 * tt * t * dot(d_p, p1) +
-                        3 * t * t * dot(d_p, p2);
-            auto d_t = -d_tt +
-                       3 * tt * tt * dot(d_p, p1) +
-                       6 * tt * t * dot(d_p, p2) +
-                       3 * t * t * dot(d_p, p3);
-            d_p0 += d_p * (tt * tt * tt);
-            d_p1 += d_p * (3 * tt * tt * t);
-            d_p2 += d_p * (3 * tt * t * t);
-            d_p3 += d_p * (t * t * t);
-            // implicit function theorem: dt/dA = -1/(p'(t)) * dp/dA
-            auto poly_deriv_t = eval_polynomial_deriv(t);
-            if (fabs(poly_deriv_t) > 1e-10f) {
-                auto d_B = -(d_t / poly_deriv_t) * t * t * t * t;
-                auto d_C = -(d_t / poly_deriv_t) * t * t * t;
-                auto d_D = -(d_t / poly_deriv_t) * t * t;
-                auto d_E = -(d_t / poly_deriv_t) * t;
-                auto d_F = -(d_t / poly_deriv_t);
-                // B = B' / A
-                // C = C' / A
-                // D = D' / A
-                // E = E' / A
-                // F = F' / A
-                auto d_A = -d_B * B / A
-                           -d_C * C / A
-                           -d_D * D / A
-                           -d_E * E / A
-                           -d_F * F / A;
-                d_B /= A;
-                d_C /= A;
-                d_D /= A;
-                d_E /= A;
-                d_F /= A;
-                {
-                    double A = 3*sum((-p0+3*p1-3*p2+p3)*(-p0+3*p1-3*p2+p3)) + 1e-3;
-                    double B = 5*sum((-p0+3*p1-3*p2+p3)*(3*p0-6*p1+3*p2));
-                    double C = 4*sum((-p0+3*p1-3*p2+p3)*(-3*p0+3*p1)) + 2*sum((3*p0-6*p1+3*p2)*(3*p0-6*p1+3*p2));
-                    double D = 3*(sum((3*p0-6*p1+3*p2)*(-3*p0+3*p1)) + sum((-p0+3*p1-3*p2+p3)*(p0-pt)));
-                    double E = sum((-3*p0+3*p1)*(-3*p0+3*p1)) + 2*sum((p0-pt)*(3*p0-6*p1+3*p2));
-                    double F = sum((p0-pt)*(-3*p0+3*p1));
-                    B /= A;
-                    C /= A;
-                    D /= A;
-                    E /= A;
-                    F /= A;
-                    auto eval_polynomial = [&] (double t) {
-                        return t*t*t*t*t+
-                               B*t*t*t*t+
-                               C*t*t*t+
-                               D*t*t+
-                               E*t+
-                               F;
-                    };
-                    auto eval_polynomial_deriv = [&] (double t) {
-                        return 5*t*t*t*t+
-                               4*B*t*t*t+
-                               3*C*t*t+
-                               2*D*t+
-                               E;
-                    };
-                    auto lb = t - 1e-2f;
-                    auto ub = t + 1e-2f;
-                    auto lb_eval = eval_polynomial(lb);
-                    auto ub_eval = eval_polynomial(ub);
-                    if (lb_eval > ub_eval) {
-                        swap_(lb, ub);
-                    }
-                    auto t_ = 0.5f * (lb + ub);
-                    auto num_iter = 20;
-                    for (int it = 0; it < num_iter; it++) {
-                        if (!(t_ >= lb && t_ <= ub)) {
-                            t_ = 0.5f * (lb + ub);
-                        }
-                        auto value = eval_polynomial(t_);
-                        if (fabs(value) < 1e-5f || it == num_iter - 1) {
-                            break;
-                        }
-                        // The derivative may not be entirely accurate,
-                        // but the bisection is going to handle this
-                        if (value > 0.f) {
-                            ub = t_;
-                        } else {
-                            lb = t_;
-                        }
-                        auto derivative = eval_polynomial_deriv(t);
-                        t_ -= value / derivative;
-                    }
-                }
-                // A = 3*sum((-p0+3*p1-3*p2+p3)*(-p0+3*p1-3*p2+p3))
-                d_p0 += d_A * 3 * (-1) * 2 * (-p0+3*p1-3*p2+p3);
-                d_p1 += d_A * 3 *   3  * 2 * (-p0+3*p1-3*p2+p3);
-                d_p2 += d_A * 3 * (-3) * 2 * (-p0+3*p1-3*p2+p3);
-                d_p3 += d_A * 3 *   1  * 2 * (-p0+3*p1-3*p2+p3);
-                // B = 5*sum((-p0+3*p1-3*p2+p3)*(3*p0-6*p1+3*p2))
-                d_p0 += d_B * 5 * ((-1) * (3*p0-6*p1+3*p2) + 3 * (-p0+3*p1-3*p2+p3));
-                d_p1 += d_B * 5 * (3 * (3*p0-6*p1+3*p2) + (-6) * (-p0+3*p1-3*p2+p3));
-                d_p2 += d_B * 5 * ((-3) * (3*p0-6*p1+3*p2) + 3 * (-p0+3*p1-3*p2+p3));
-                d_p3 += d_B * 5 * (3*p0-6*p1+3*p2);
-                // C = 4*sum((-p0+3*p1-3*p2+p3)*(-3*p0+3*p1)) + 2*sum((3*p0-6*p1+3*p2)*(3*p0-6*p1+3*p2))
-                d_p0 += d_C * 4 * ((-1) * (-3*p0+3*p1) + (-3) * (-p0+3*p1-3*p2+p3)) +
-                        d_C * 2 * (3 * 2 * (3*p0-6*p1+3*p2));
-                d_p1 += d_C * 4 * (3 * (-3*p0+3*p1) + 3 * (-p0+3*p1-3*p2+p3)) +
-                        d_C * 2 * ((-6) * 2 * (3*p0-6*p1+3*p2));
-                d_p2 += d_C * 4 * ((-3) * (-3*p0+3*p1)) +
-                        d_C * 2 * (3 * 2 * (3*p0-6*p1+3*p2));
-                d_p3 += d_C * 4 * (-3*p0+3*p1);
-                // D = 3*(sum((3*p0-6*p1+3*p2)*(-3*p0+3*p1)) + sum((-p0+3*p1-3*p2+p3)*(p0-pt)))
-                d_p0 += d_D * 3 * (3 * (-3*p0+3*p1) + (-3) * (3*p0-6*p1+3*p2)) +
-                        d_D * 3 * ((-1) * (p0-pt) + 1 * (-p0+3*p1-3*p2+p3));
-                d_p1 += d_D * 3 * ((-6) * (-3*p0+3*p1) + (3) * (3*p0-6*p1+3*p2)) +
-                        d_D * 3 * (3 * (p0-pt));
-                d_p2 += d_D * 3 * (3 * (-3*p0+3*p1)) +
-                        d_D * 3 * ((-3) * (p0-pt));
-                d_pt += d_D * 3 * ((-1) * (-p0+3*p1-3*p2+p3));
-                // E = sum((-3*p0+3*p1)*(-3*p0+3*p1)) + 2*sum((p0-pt)*(3*p0-6*p1+3*p2))
-                d_p0 += d_E * ((-3) * 2 * (-3*p0+3*p1)) +
-                        d_E * 2 * (1 * (3*p0-6*p1+3*p2) + 3 * (p0-pt));
-                d_p1 += d_E * (  3  * 2 * (-3*p0+3*p1)) +
-                        d_E * 2 * ((-6) * (p0-pt));
-                d_p2 += d_E * 2 * (  3  * (p0-pt));
-                d_pt += d_E * 2 * ((-1) * (3*p0-6*p1+3*p2));
-                // F = sum((p0-pt)*(-3*p0+3*p1))
-                d_p0 += d_F * (1 * (-3*p0+3*p1)) +
-                        d_F * ((-3) * (p0-pt));
-                d_p1 += d_F * (3 * (p0-pt));
-                d_pt += d_F * ((-1) * (-3*p0+3*p1));
-            }
-        }
-        atomic_add(d_path.points + 2 * i0, d_p0);
-        atomic_add(d_path.points + 2 * i1, d_p1);
-        atomic_add(d_path.points + 2 * i2, d_p2);
-        atomic_add(d_path.points + 2 * i3, d_p3);
     } else {
-        assert(false);
+        auto t = min_t_root;
+        if (t == 0) {
+            d_P[0] += d_closest_pt;
+        } else if (t == 1) {
+            d_P[n] += d_closest_pt;
+        } else {
+            auto tt = 1 - t;
+            // Bernstein basis B, B', B'' at t
+            float B[4] = {0, 0, 0, 0};
+            float dB[4] = {0, 0, 0, 0};
+            float ddB[4] = {0, 0, 0, 0};
+            if (n == 2) {
+                B[0] = tt * tt; B[1] = 2 * tt * t; B[2] = t * t;
+                dB[0] = -2 * tt; dB[1] = 2 * (tt - t); dB[2] = 2 * t;
+                ddB[0] = 2; ddB[1] = -4; ddB[2] = 2;
+            } else {
+                B[0] = tt * tt * tt; B[1] = 3 * tt * tt * t; B[2] = 3 * tt * t * t; B[3] = t * t * t;
+                dB[0] = -3 * tt * tt; dB[1] = 3 * tt * (tt - 2 * t); dB[2] = 3 * t * (2 * tt - t); dB[3] = 3 * t * t;
+                ddB[0] = 6 * tt; ddB[1] = 6 * (3 * t - 2); ddB[2] = 6 * (1 - 3 * t); ddB[3] = 6 * t;
+            }
+            // q is relative to pt
+            auto q = Vector2f{0, 0};
+            auto dq = Vector2f{0, 0};
+            auto ddq = Vector2f{0, 0};
+            for (int i = 0; i <= n; i++) {
+                q += B[i] * P[i];
+                dq += dB[i] * P[i];
+                ddq += ddB[i] * P[i];
+            }
+            for (int i = 0; i <= n; i++) {
+                d_P[i] += B[i] * d_closest_pt;
+            }
+            auto G_t = dot(dq, dq) + dot(q, ddq);
+            auto scale = dot(dq, dq) + length(q) * length(ddq);
+            if (scale > 0 && fabs(G_t) > 1e-6f * scale) {
+                // d_t_root: extra gradient w.r.t. t from callers whose output also
+                // depends on the closest-point parameter (prefiltered thickness)
+                auto k = -(dot(d_closest_pt, dq) + d_t_root) / G_t;
+                for (int i = 0; i <= n; i++) {
+                    d_P[i] += k * (B[i] * dq + dB[i] * q);
+                }
+                d_pt += (-k) * dq;
+            }
+        }
+    }
+    for (int i = 0; i <= n; i++) {
+        atomic_add(d_path.points + 2 * idx[i], d_P[i]);
     }
 }
 
@@ -935,7 +889,9 @@ void d_closest_point(const Rect &rect,
                      Vector2f &d_pt) {
     auto dist = [&](const Vector2f &p0, const Vector2f &p1) -> float {
         // project pt to line
-        auto t = dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0);
+        // zero-length segment: 0/0 = NaN would skip every branch below with a NaN
+        // distance; treat it as the point p0 (as geometry.metal does)
+        auto t = dot(p1 - p0, p1 - p0) > 0 ? dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0) : -1.f;
         if (t < 0) {
             return distance(p0, pt);
         } else if (t > 1) {
@@ -963,7 +919,9 @@ void d_closest_point(const Rect &rect,
                         const Vector2f &d_closest_pt,
                         Vector2f &d_p0, Vector2f &d_p1) {
         // project pt to line
-        auto t = dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0);
+        // zero-length segment: 0/0 = NaN would skip every branch below with a NaN
+        // distance; treat it as the point p0 (as geometry.metal does)
+        auto t = dot(p1 - p0, p1 - p0) > 0 ? dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0) : -1.f;
         if (t < 0) {
             d_p0 += d_closest_pt;
         } else if (t > 1) {
@@ -1023,7 +981,8 @@ void d_closest_point(const Shape &shape,
                      const Vector2f &d_closest_pt,
                      const ClosestPointPathInfo &path_info,
                      Shape &d_shape,
-                     Vector2f &d_pt) {
+                     Vector2f &d_pt,
+                     float d_t_root = 0) {
     switch (shape.type) {
         case ShapeType::Circle:
             d_closest_point(*(const Circle *)shape.ptr,
@@ -1045,7 +1004,8 @@ void d_closest_point(const Shape &shape,
                             d_closest_pt,
                             path_info,
                             *(Path *)d_shape.ptr,
-                            d_pt);
+                            d_pt,
+                            d_t_root);
             break;
         case ShapeType::Rect:
             d_closest_point(*(const Rect *)shape.ptr,
@@ -1068,7 +1028,8 @@ void d_compute_distance(const Matrix3x3f &canvas_to_shape,
                         float d_dist,
                         Matrix3x3f &d_shape_to_canvas,
                         Shape &d_shape,
-                        float *d_translation) {
+                        float *d_translation,
+                        float d_t_root = 0) {
     if (distance_squared(pt, closest_pt) < 1e-10f) {
         // The derivative at distance=0 is undefined
         return;
@@ -1092,7 +1053,7 @@ void d_compute_distance(const Matrix3x3f &canvas_to_shape,
                d_shape_to_canvas_, d_local_closest_pt);
     assert(isfinite(d_local_closest_pt));
     auto d_local_pt = Vector2f{0, 0};
-    d_closest_point(shape, local_pt, d_local_closest_pt, path_info, d_shape, d_local_pt);
+    d_closest_point(shape, local_pt, d_local_closest_pt, path_info, d_shape, d_local_pt, d_t_root);
     assert(isfinite(d_local_pt));
     auto d_canvas_to_shape = Matrix3x3f();
     d_xform_pt(canvas_to_shape,

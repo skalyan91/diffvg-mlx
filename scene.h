@@ -64,6 +64,14 @@ struct Scene {
     ShapeGroup get_d_shape_group(int group_id) const;
     Shape get_d_shape(int shape_id) const;
     float get_d_filter_radius() const;
+
+    // Flattens the built scene into the pools read by the Metal kernels
+    // (layout: pydiffvg/metal/common.metal). ip has 64 entries; ints and
+    // floats are zero-padded to at least 64 entries, while
+    // ip[IP_NUM_INTS] / ip[IP_NUM_FLOATS] hold the unpadded sizes.
+    void export_flat(std::vector<int> &ip,
+                     std::vector<int> &ints,
+                     std::vector<float> &floats) const;
 };
 
 struct SceneData {

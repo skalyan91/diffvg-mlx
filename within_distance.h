@@ -57,7 +57,9 @@ bool within_distance(const Path &path, const BVHNode *bvh_nodes, const Vector2f 
                 auto p0 = Vector2f{path.points[2 * i0], path.points[2 * i0 + 1]};
                 auto p1 = Vector2f{path.points[2 * i1], path.points[2 * i1 + 1]};
                 // project pt to line
-                auto t = dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0);
+                // zero-length segment: 0/0 = NaN would skip every branch below with a NaN
+                // distance; treat it as the point p0 (as geometry.metal does)
+                auto t = dot(p1 - p0, p1 - p0) > 0 ? dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0) : -1.f;
                 auto r0 = r;
                 auto r1 = r;
                 // override radius if path has thickness
@@ -166,128 +168,23 @@ bool within_distance(const Path &path, const BVHNode *bvh_nodes, const Vector2f 
                 if (distance_squared(eval(1), pt) < r3*r3) {
                     return true;
                 }
-                // The curve is (1 - t)^3 p0 + 3 * (1 - t)^2 t p1 + 3 * (1 - t) t^2 p2 + t^3 p3
-                // = (-p0+3p1-3p2+p3) t^3 + (3p0-6p1+3p2) t^2 + (-3p0+3p1) t + p0
-                // Want to solve (q - pt) dot q' = 0
-                // q' = 3*(-p0+3p1-3p2+p3)t^2 + 2*(3p0-6p1+3p2)t + (-3p0+3p1)
-                // Expanding 
-                // 3*(-p0+3p1-3p2+p3)^2 t^5
-                // 5*(-p0+3p1-3p2+p3)(3p0-6p1+3p2) t^4
-                // 4*(-p0+3p1-3p2+p3)(-3p0+3p1) + 2*(3p0-6p1+3p2)^2 t^3
-                // 3*(3p0-6p1+3p2)(-3p0+3p1) + 3*(-p0+3p1-3p2+p3)(p0-pt) t^2
-                // (-3p0+3p1)^2+2(p0-pt)(3p0-6p1+3p2) t
-                // (p0-pt)(-3p0+3p1)
-                double A = 3*sum((-p0+3*p1-3*p2+p3)*(-p0+3*p1-3*p2+p3));
-                double B = 5*sum((-p0+3*p1-3*p2+p3)*(3*p0-6*p1+3*p2));
-                double C = 4*sum((-p0+3*p1-3*p2+p3)*(-3*p0+3*p1)) + 2*sum((3*p0-6*p1+3*p2)*(3*p0-6*p1+3*p2));
-                double D = 3*(sum((3*p0-6*p1+3*p2)*(-3*p0+3*p1)) + sum((-p0+3*p1-3*p2+p3)*(p0-pt)));
-                double E = sum((-3*p0+3*p1)*(-3*p0+3*p1)) + 2*sum((p0-pt)*(3*p0-6*p1+3*p2));
-                double F = sum((p0-pt)*(-3*p0+3*p1));
-                // normalize the polynomial
-                B /= A;
-                C /= A;
-                D /= A;
-                E /= A;
-                F /= A;
-                // Isolator Polynomials:
-                // https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.133.2233&rep=rep1&type=pdf
-                //                                       x/5 + B/25
-                //                                    /-----------------------------------------------------
-                // 5x^4 + 4B x^3 + 3C x^2 + 2D x + E /   x^5 +    B x^4 +       C x^3 +      D x^2 +      E x + F
-                //                                       x^5 + 4B/5 x^4 +    3C/5 x^3 +   2D/5 x^2 +    E/5 x
-                //                                      ----------------------------------------------------
-                //                                              B/5 x^4 +    2C/5 x^3 +   3D/5 x^2 +   4E/5 x + F
-                //                                              B/5 x^4 + 4B^2/25 x^3 + 3BC/25 x^2 + 2BD/25 x + BE/25
-                //                                      ----------------------------------------------------
-                //                                     (2C/5 - 4B^2/25)x^3 + (3D/5-3BC/25)x^2 + (4E/5-2BD/25) + (F-BE/25)
-                auto p1A = ((2 / 5.f) * C - (4 / 25.f) * B * B);
-                auto p1B = ((3 / 5.f) * D - (3 / 25.f) * B * C);
-                auto p1C = ((4 / 5.f) * E - (2 / 25.f) * B * D);
-                auto p1D = F - B * E / 25.f;
-                // auto q1A = 1 / 5.f;
-                // auto q1B = B / 25.f;
-                // x/5 + B/25 = 0
-                // x = -B/5
-                auto q_root = -B/5.f;
-                double p_roots[3];
-                int num_sol = solve_cubic(p1A, p1B, p1C, p1D, p_roots);
-                float intervals[4];
-                if (q_root >= 0 && q_root <= 1) {
-                    intervals[0] = q_root;
-                }
-                for (int j = 0; j < num_sol; j++) {
-                    intervals[j + 1] = p_roots[j];
-                }
-                auto num_intervals = 1 + num_sol;
-                // sort intervals
-                for (int j = 1; j < num_intervals; j++) {
-                    for (int k = j; k > 0 && intervals[k - 1] > intervals[k]; k--) {
-                        auto tmp = intervals[k];
-                        intervals[k] = intervals[k - 1];
-                        intervals[k - 1] = tmp;
-                    }
-                }
-                auto eval_polynomial = [&] (double t) {
-                    return t*t*t*t*t+
-                           B*t*t*t*t+
-                           C*t*t*t+
-                           D*t*t+
-                           E*t+
-                           F;
-                };
-                auto eval_polynomial_deriv = [&] (double t) {
-                    return 5*t*t*t*t+
-                           4*B*t*t*t+
-                           3*C*t*t+
-                           2*D*t+
-                           E;
-                };
-                auto lower_bound = 0.f;
-                for (int j = 0; j < num_intervals + 1; j++) {
-                    if (j < num_intervals && intervals[j] < 0.f) {
-                        continue;
-                    }
-                    auto upper_bound = j < num_intervals ?
-                        min(intervals[j], 1.f) : 1.f;
-                    auto lb = lower_bound;
-                    auto ub = upper_bound;
-                    auto lb_eval = eval_polynomial(lb);
-                    auto ub_eval = eval_polynomial(ub);
-                    if (lb_eval * ub_eval > 0) {
-                        // Doesn't have root
-                        continue;
-                    }
-                    if (lb_eval > ub_eval) {
-                        swap_(lb, ub);
-                    }
-                    auto t = 0.5f * (lb + ub);
-                    for (int it = 0; it < 20; it++) {
-                        if (!(t >= lb && t <= ub)) {
-                            t = 0.5f * (lb + ub);
+                // Stationary points of the distance to the centre line: roots in
+                // [0, 1] of the quintic (q(t) - pt) . q'(t), found robustly in
+                // Bernstein form (see cubic_closest_roots). The interpolated
+                // radius is at most max(r0..r3), so skip the search when the
+                // convex-hull capsule is farther than that.
+                auto max_r = max(max(r0, r1), max(r2, r3));
+                if (cubic_distance_lower_bound(p0, p1, p2, p3, pt) < max_r) {
+                    double roots[5];
+                    int num_roots = cubic_closest_roots(p0, p1, p2, p3, pt, roots);
+                    for (int j = 0; j < num_roots; j++) {
+                        auto t = float(roots[j]);
+                        auto tt = 1 - t;
+                        auto r = (tt*tt*tt)*r0 + (3*tt*tt*t)*r1 + (3*tt*t*t)*r2 + (t*t*t)*r3;
+                        if (distance_squared(eval(t), pt) < r * r) {
+                            return true;
                         }
-                        auto value = eval_polynomial(t);
-                        if (fabs(value) < 1e-5f || it == 19) {
-                            break;
-                        }
-                        // The derivative may not be entirely accurate,
-                        // but the bisection is going to handle this
-                        if (value > 0.f) {
-                            ub = t;
-                        } else {
-                            lb = t;
-                        }
-                        auto derivative = eval_polynomial_deriv(t);
-                        t -= value / derivative;
                     }
-                    auto tt = 1 - t;
-                    auto r = (tt*tt*tt)*r0 + (3*tt*tt*t)*r1 + (3*tt*t*t)*r2 + (t*t*t)*r3;
-                    if (distance_squared(eval(t), pt) < r * r) {
-                        return true;
-                    }
-                    if (upper_bound >= 1.f) {
-                        break;
-                    }
-                    lower_bound = upper_bound;
                 }
             } else {
                 assert(false);
@@ -313,7 +210,9 @@ inline
 int within_distance(const Rect &rect, const Vector2f &pt, float r) {
     auto test = [&](const Vector2f &p0, const Vector2f &p1) {
         // project pt to line
-        auto t = dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0);
+        // zero-length segment: 0/0 = NaN would skip every branch below with a NaN
+        // distance; treat it as the point p0 (as geometry.metal does)
+        auto t = dot(p1 - p0, p1 - p0) > 0 ? dot(pt - p0, p1 - p0) / dot(p1 - p0, p1 - p0) : -1.f;
         if (t < 0) {
             if (distance_squared(p0, pt) < r * r) {
                 return true;

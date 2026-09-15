@@ -18,6 +18,7 @@
 #include "within_distance.h"
 #include <cassert>
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
@@ -111,6 +112,61 @@ DEVICE void accumulate_boundary_gradient(const Shape &shape,
     //   dot(M v_local, canvas_normal) = dot(v_local, normal) / |M^{-T} normal|
     // so we use the local normal with contrib scaled by local_velocity_scale.
     auto contrib = canvas_contrib * local_velocity_scale;
+    // Stroke flank of a path with per-point thickness (sample_boundary sets
+    // offset_dir): the boundary point is b = c(t) + dir r(t) n(t) with
+    // n = perp(c') / |c'|, and `normal` is the normal of the offset curve b,
+    // which differs from +-n when r varies. The Reynolds term is
+    // dot(velocity of b, normal), so
+    //  * thickness r_i: velocity dir B_i n      -> B_i dir dot(n, normal)
+    //  * point p_i:     velocity B_i e_k + dir r dn/dp_i,
+    //                   dn/dp_i[k] = B'_i (perp(e_k) - n dot(n, perp(e_k))) / |c'|
+    // For uniform-width strokes (and caps / joins) normal = +-n, the rotation
+    // term vanishes and the code below reduces to the plain velocities.
+    auto flank_dir = 0.f;
+    auto flank_n = Vector2f{0, 0};
+    auto flank_len = 0.f;
+    auto flank_r = 0.f;
+    int flank_degree = 0;
+    int flank_idx[4] = {0, 0, 0, 0};
+    float flank_dB[4] = {0, 0, 0, 0};
+    if (boundary_data.is_stroke && shape.type == ShapeType::Path &&
+            boundary_data.path.offset_dir != 0) {
+        const Path &path = *(const Path *)shape.ptr;
+        if (path.thickness != nullptr) {
+            auto point_id = boundary_data.path.point_id;
+            auto t = boundary_data.path.t;
+            auto tt = 1 - t;
+            int n = path.num_control_points[boundary_data.path.base_point_id] + 1;
+            float B[4] = {0, 0, 0, 0};
+            float dB[4] = {0, 0, 0, 0};
+            if (n == 1) {
+                B[0] = tt; B[1] = t;
+                dB[0] = -1; dB[1] = 1;
+            } else if (n == 2) {
+                B[0] = tt * tt; B[1] = 2 * tt * t; B[2] = t * t;
+                dB[0] = -2 * tt; dB[1] = 2 * (tt - t); dB[2] = 2 * t;
+            } else {
+                B[0] = tt * tt * tt; B[1] = 3 * tt * tt * t; B[2] = 3 * tt * t * t; B[3] = t * t * t;
+                dB[0] = -3 * tt * tt; dB[1] = 3 * tt * (tt - 2 * t); dB[2] = 3 * t * (2 * tt - t); dB[3] = 3 * t * t;
+            }
+            auto d1 = Vector2f{0, 0};
+            auto r = 0.f;
+            for (int i = 0; i <= n; i++) {
+                flank_idx[i] = i == n ? (point_id + i) % path.num_points : point_id + i;
+                d1 += dB[i] * Vector2f{path.points[2 * flank_idx[i]], path.points[2 * flank_idx[i] + 1]};
+                r += B[i] * path.thickness[flank_idx[i]];
+                flank_dB[i] = dB[i];
+            }
+            auto len = length(d1);
+            if (len > 0) {
+                flank_dir = boundary_data.path.offset_dir;
+                flank_n = Vector2f{-d1.y, d1.x} / len;
+                flank_len = len;
+                flank_r = r;
+                flank_degree = n;
+            }
+        }
+    }
     if (boundary_data.is_stroke) {
         auto has_path_thickness = false;
         if (shape.type == ShapeType::Path) {
@@ -119,6 +175,8 @@ DEVICE void accumulate_boundary_gradient(const Shape &shape,
         }
         // differentiate stroke width: velocity is the same as normal
         if (has_path_thickness) {
+            auto thickness_contrib = flank_dir != 0 ?
+                contrib * flank_dir * dot(flank_n, normal) : contrib;
             Path *d_p = (Path*)d_shape.ptr;
             auto base_point_id = boundary_data.path.base_point_id;
             auto point_id = boundary_data.path.point_id;
@@ -129,27 +187,27 @@ DEVICE void accumulate_boundary_gradient(const Shape &shape,
                 auto i0 = point_id;
                 auto i1 = (point_id + 1) % path.num_points;
                 // r = r0 + t * (r1 - r0)
-                atomic_add(&d_p->thickness[i0], (1 - t) * contrib);
-                atomic_add(&d_p->thickness[i1], (    t) * contrib);
+                atomic_add(&d_p->thickness[i0], (1 - t) * thickness_contrib);
+                atomic_add(&d_p->thickness[i1], (    t) * thickness_contrib);
             } else if (path.num_control_points[base_point_id] == 1) {
                 // Quadratic Bezier curve
                 auto i0 = point_id;
                 auto i1 = point_id + 1;
                 auto i2 = (point_id + 2) % path.num_points;
                 // r = (1-t)^2r0 + 2(1-t)t r1 + t^2 r2
-                atomic_add(&d_p->thickness[i0], square(1 - t) * contrib);
-                atomic_add(&d_p->thickness[i1], (2*(1-t)*t) * contrib);
-                atomic_add(&d_p->thickness[i2], (t*t) * contrib);
+                atomic_add(&d_p->thickness[i0], square(1 - t) * thickness_contrib);
+                atomic_add(&d_p->thickness[i1], (2*(1-t)*t) * thickness_contrib);
+                atomic_add(&d_p->thickness[i2], (t*t) * thickness_contrib);
             } else if (path.num_control_points[base_point_id] == 2) {
                 auto i0 = point_id;
                 auto i1 = point_id + 1;
                 auto i2 = point_id + 2;
                 auto i3 = (point_id + 3) % path.num_points;
                 // r = (1-t)^3r0 + 3*(1-t)^2tr1 + 3*(1-t)t^2r2 + t^3r3
-                atomic_add(&d_p->thickness[i0], cubic(1 - t) * contrib);
-                atomic_add(&d_p->thickness[i1], 3 * square(1 - t) * t * contrib);
-                atomic_add(&d_p->thickness[i2], 3 * (1 - t) * t * t * contrib);
-                atomic_add(&d_p->thickness[i3], t * t * t * contrib);
+                atomic_add(&d_p->thickness[i0], cubic(1 - t) * thickness_contrib);
+                atomic_add(&d_p->thickness[i1], 3 * square(1 - t) * t * thickness_contrib);
+                atomic_add(&d_p->thickness[i2], 3 * (1 - t) * t * t * thickness_contrib);
+                atomic_add(&d_p->thickness[i3], t * t * t * thickness_contrib);
             } else {
                 assert(false);
             }
@@ -248,6 +306,19 @@ DEVICE void accumulate_boundary_gradient(const Shape &shape,
                 atomic_add(&d_p->points[2 * i3 + 1], t * t * t * normal.y * contrib);
             } else {
                 assert(false);
+            }
+            if (flank_dir != 0) {
+                // rotation of the offset direction: dir r dn/dp_i . normal
+                auto nx = flank_n.x;
+                auto ny = flank_n.y;
+                // perp(e_x) = (0, 1), perp(e_y) = (-1, 0)
+                auto gx = dot(Vector2f{-nx * ny, 1 - ny * ny}, normal);
+                auto gy = dot(Vector2f{nx * nx - 1, nx * ny}, normal);
+                auto s = contrib * flank_dir * flank_r / flank_len;
+                for (int i = 0; i <= flank_degree; i++) {
+                    atomic_add(&d_p->points[2 * flank_idx[i] + 0], flank_dB[i] * s * gx);
+                    atomic_add(&d_p->points[2 * flank_idx[i] + 1], flank_dB[i] * s * gy);
+                }
             }
             break;
         } case ShapeType::Rect: {
@@ -574,7 +645,9 @@ Vector4f sample_color(const SceneData &scene,
     int bvh_stack[max_bvh_stack_size];
     auto stack_size = 0;
     auto num_fragments = 0;
-    bvh_stack[stack_size++] = 2 * scene.num_shape_groups - 2;
+    if (scene.num_shape_groups > 0) {
+        bvh_stack[stack_size++] = 2 * scene.num_shape_groups - 2;
+    }
     while (stack_size > 0) {
         const BVHNode &node = scene.bvh_nodes[bvh_stack[--stack_size]];
         if (node.child1 < 0) {
@@ -625,7 +698,9 @@ Vector4f sample_color(const SceneData &scene,
     if (num_fragments <= 0) {
         if (background_color != nullptr) {
             if (d_background_color != nullptr) {
-                *d_background_color = *d_color;
+                // Several samples (and threads) share one background pixel:
+                // accumulate atomically instead of overwriting.
+                atomic_add(*d_background_color, *d_color);
             }
             return *background_color;
         }
@@ -726,10 +801,10 @@ Vector4f sample_color(const SceneData &scene,
             d_curr_alpha = d_prev_alpha;
         }
         if (d_background_color != nullptr) {
-            d_background_color->x += d_curr_color.x;
-            d_background_color->y += d_curr_color.y;
-            d_background_color->z += d_curr_color.z;
-            d_background_color->w += d_curr_alpha;
+            atomic_add(d_background_color->x, d_curr_color.x);
+            atomic_add(d_background_color->y, d_curr_color.y);
+            atomic_add(d_background_color->z, d_curr_color.z);
+            atomic_add(d_background_color->w, d_curr_alpha);
         }
     }
     return Vector4f{final_color[0], final_color[1], final_color[2], final_alpha};
@@ -873,6 +948,146 @@ float d_smoothstep(float d, float d_ret) {
     return d_t / 2.f;
 }
 
+// Stroke radius used by prefiltered rendering at the closest point of a shape.
+// For a path with per-point thickness the serialized stroke_width is a dummy 0,
+// so interpolate the thickness at the closest point (segment base_point_id,
+// first point point_id, parameter t_root) with the Bezier basis weights, exactly
+// as accumulate_boundary_gradient does.
+DEVICE
+inline
+float prefilter_stroke_radius(const Shape &shape, const ClosestPointPathInfo &info) {
+    if (shape.type != ShapeType::Path) {
+        return shape.stroke_width;
+    }
+    const Path &path = *(const Path *)shape.ptr;
+    if (path.thickness == nullptr || info.base_point_id < 0) {
+        return shape.stroke_width;
+    }
+    auto point_id = info.point_id;
+    auto t = info.t_root;
+    switch (path.num_control_points[info.base_point_id]) {
+        case 0: {
+            auto i0 = point_id;
+            auto i1 = (point_id + 1) % path.num_points;
+            return (1 - t) * path.thickness[i0] + t * path.thickness[i1];
+        }
+        case 1: {
+            auto i0 = point_id;
+            auto i1 = point_id + 1;
+            auto i2 = (point_id + 2) % path.num_points;
+            return square(1 - t) * path.thickness[i0] +
+                   (2 * (1 - t) * t) * path.thickness[i1] +
+                   (t * t) * path.thickness[i2];
+        }
+        case 2: {
+            auto i0 = point_id;
+            auto i1 = point_id + 1;
+            auto i2 = point_id + 2;
+            auto i3 = (point_id + 3) % path.num_points;
+            return cubic(1 - t) * path.thickness[i0] +
+                   3 * square(1 - t) * t * path.thickness[i1] +
+                   3 * (1 - t) * t * t * path.thickness[i2] +
+                   t * t * t * path.thickness[i3];
+        }
+        default:
+            assert(false);
+    }
+    return shape.stroke_width;
+}
+
+// Backward of prefilter_stroke_radius with the closest-point parameter t held
+// fixed. The dependence of the interpolated radius on t is handled separately:
+// the caller passes d_radius * prefilter_stroke_radius_dt as d_t_root to
+// d_compute_distance, which applies dt/dparams (implicit function theorem).
+DEVICE
+inline
+void d_prefilter_stroke_radius(const Shape &shape, const ClosestPointPathInfo &info,
+                               float d_radius, Shape &d_shape) {
+    if (shape.type == ShapeType::Path) {
+        const Path &path = *(const Path *)shape.ptr;
+        if (path.thickness != nullptr && info.base_point_id >= 0) {
+            Path *d_p = (Path*)d_shape.ptr;
+            auto point_id = info.point_id;
+            auto t = info.t_root;
+            switch (path.num_control_points[info.base_point_id]) {
+                case 0: {
+                    auto i0 = point_id;
+                    auto i1 = (point_id + 1) % path.num_points;
+                    atomic_add(&d_p->thickness[i0], (1 - t) * d_radius);
+                    atomic_add(&d_p->thickness[i1], (    t) * d_radius);
+                    break;
+                }
+                case 1: {
+                    auto i0 = point_id;
+                    auto i1 = point_id + 1;
+                    auto i2 = (point_id + 2) % path.num_points;
+                    atomic_add(&d_p->thickness[i0], square(1 - t) * d_radius);
+                    atomic_add(&d_p->thickness[i1], (2 * (1 - t) * t) * d_radius);
+                    atomic_add(&d_p->thickness[i2], (t * t) * d_radius);
+                    break;
+                }
+                case 2: {
+                    auto i0 = point_id;
+                    auto i1 = point_id + 1;
+                    auto i2 = point_id + 2;
+                    auto i3 = (point_id + 3) % path.num_points;
+                    atomic_add(&d_p->thickness[i0], cubic(1 - t) * d_radius);
+                    atomic_add(&d_p->thickness[i1], 3 * square(1 - t) * t * d_radius);
+                    atomic_add(&d_p->thickness[i2], 3 * (1 - t) * t * t * d_radius);
+                    atomic_add(&d_p->thickness[i3], t * t * t * d_radius);
+                    break;
+                }
+                default:
+                    assert(false);
+            }
+            return;
+        }
+    }
+    atomic_add(&d_shape.stroke_width, d_radius);
+}
+
+// d prefilter_stroke_radius / d t at the closest point (0 unless the shape is a
+// path with per-point thickness).
+DEVICE
+inline
+float prefilter_stroke_radius_dt(const Shape &shape, const ClosestPointPathInfo &info) {
+    if (shape.type != ShapeType::Path) {
+        return 0;
+    }
+    const Path &path = *(const Path *)shape.ptr;
+    if (path.thickness == nullptr || info.base_point_id < 0) {
+        return 0;
+    }
+    auto point_id = info.point_id;
+    auto t = info.t_root;
+    auto tt = 1 - t;
+    const float *r = path.thickness;
+    switch (path.num_control_points[info.base_point_id]) {
+        case 0: {
+            auto i0 = point_id;
+            auto i1 = (point_id + 1) % path.num_points;
+            return r[i1] - r[i0];
+        }
+        case 1: {
+            auto i0 = point_id;
+            auto i1 = point_id + 1;
+            auto i2 = (point_id + 2) % path.num_points;
+            return 2 * tt * (r[i1] - r[i0]) + 2 * t * (r[i2] - r[i1]);
+        }
+        case 2: {
+            auto i0 = point_id;
+            auto i1 = point_id + 1;
+            auto i2 = point_id + 2;
+            auto i3 = (point_id + 3) % path.num_points;
+            return 3 * tt * tt * (r[i1] - r[i0]) + 6 * tt * t * (r[i2] - r[i1]) +
+                   3 * t * t * (r[i3] - r[i2]);
+        }
+        default:
+            assert(false);
+    }
+    return 0;
+}
+
 DEVICE
 Vector4f sample_color_prefiltered(const SceneData &scene,
                                   const Vector4f *background_color,
@@ -891,7 +1106,9 @@ Vector4f sample_color_prefiltered(const SceneData &scene,
     int bvh_stack[max_bvh_stack_size];
     auto stack_size = 0;
     auto num_fragments = 0;
-    bvh_stack[stack_size++] = 2 * scene.num_shape_groups - 2;
+    if (scene.num_shape_groups > 0) {
+        bvh_stack[stack_size++] = 2 * scene.num_shape_groups - 2;
+    }
     while (stack_size > 0) {
         const BVHNode &node = scene.bvh_nodes[bvh_stack[--stack_size]];
         if (node.child1 < 0) {
@@ -905,10 +1122,15 @@ Vector4f sample_color_prefiltered(const SceneData &scene,
                 auto d = infinity<float>();
                 compute_distance(scene, group_id, pt, infinity<float>(),
                                  &min_shape_id, &closest_pt, &local_path_info, &d);
-                assert(min_shape_id != -1);
-                const auto &shape = scene.shapes[min_shape_id];
-                auto w = smoothstep(fabs(d) + shape.stroke_width) -
-                         smoothstep(fabs(d) - shape.stroke_width);
+                // No closest point (e.g. only degenerate geometry): no stroke
+                // fragment, instead of asserting.
+                auto w = 0.f;
+                if (min_shape_id != -1) {
+                    auto stroke_radius = prefilter_stroke_radius(scene.shapes[min_shape_id],
+                                                                 local_path_info);
+                    w = smoothstep(fabs(d) + stroke_radius) -
+                        smoothstep(fabs(d) - stroke_radius);
+                }
                 if (w > 0) {
                     auto color_alpha = sample_color(shape_group.stroke_color_type,
                                                     shape_group.stroke_color,
@@ -985,7 +1207,9 @@ Vector4f sample_color_prefiltered(const SceneData &scene,
     if (num_fragments <= 0) {
         if (background_color != nullptr) {
             if (d_background_color != nullptr) {
-                *d_background_color = *d_color;
+                // Several samples (and threads) share one background pixel:
+                // accumulate atomically instead of overwriting.
+                atomic_add(*d_background_color, *d_color);
             }
             return *background_color;
         }
@@ -1059,8 +1283,9 @@ Vector4f sample_color_prefiltered(const SceneData &scene,
             if (fragments[i].is_stroke) {
                 const auto &shape = scene.shapes[fragments[i].shape_id];
                 auto d = fragments[i].distance;
-                auto abs_d_plus_width = fabs(d) + shape.stroke_width;
-                auto abs_d_minus_width = fabs(d) - shape.stroke_width;
+                auto stroke_radius = prefilter_stroke_radius(shape, fragments[i].path_info);
+                auto abs_d_plus_width = fabs(d) + stroke_radius;
+                auto abs_d_minus_width = fabs(d) - stroke_radius;
                 auto w = smoothstep(abs_d_plus_width) -
                          smoothstep(abs_d_minus_width);
                 if (w != 0) {
@@ -1087,7 +1312,11 @@ Vector4f sample_color_prefiltered(const SceneData &scene,
                     const auto &shape_group = scene.shape_groups[group_id];
                     ShapeGroup &d_shape_group = scene.d_shape_groups[group_id];
                     Shape &d_shape = scene.d_shapes[fragments[i].shape_id];
-                    if (fabs(d_d) > 1e-10f) {
+                    // the interpolated per-point thickness also depends on the
+                    // closest-point parameter t (0 for uniform-width strokes)
+                    auto d_t_root = d_stroke_width *
+                        prefilter_stroke_radius_dt(shape, fragments[i].path_info);
+                    if (fabs(d_d) > 1e-10f || d_t_root != 0) {
                         d_compute_distance(shape_group.canvas_to_shape,
                                            shape_group.shape_to_canvas,
                                            shape,
@@ -1097,9 +1326,11 @@ Vector4f sample_color_prefiltered(const SceneData &scene,
                                            d_d,
                                            d_shape_group.shape_to_canvas,
                                            d_shape,
-                                           d_translation);
+                                           d_translation,
+                                           d_t_root);
                     }
-                    atomic_add(&d_shape.stroke_width, d_stroke_width);
+                    d_prefilter_stroke_radius(shape, fragments[i].path_info,
+                                              d_stroke_width, d_shape);
                 }
             } else {
                 const auto &shape = scene.shapes[fragments[i].shape_id];
@@ -1144,10 +1375,10 @@ Vector4f sample_color_prefiltered(const SceneData &scene,
             d_curr_alpha = d_prev_alpha;
         }
         if (d_background_color != nullptr) {
-            d_background_color->x += d_curr_color.x;
-            d_background_color->y += d_curr_color.y;
-            d_background_color->z += d_curr_color.z;
-            d_background_color->w += d_curr_alpha;
+            atomic_add(d_background_color->x, d_curr_color.x);
+            atomic_add(d_background_color->y, d_curr_color.y);
+            atomic_add(d_background_color->z, d_curr_color.z);
+            atomic_add(d_background_color->w, d_curr_alpha);
         }
     }
     return Vector4f{final_color[0], final_color[1], final_color[2], final_alpha};
@@ -1183,6 +1414,10 @@ struct weight_kernel {
                                                                xc - pt.x,
                                                                yc - pt.y);
                     atomic_add(weight_image[yy * width + xx], filter_weight);
+                    if (d_weight_image != nullptr) {
+                        atomic_add(d_weight_image[yy * width + xx],
+                            filter_weight_d_radius(*scene.filter, xc - pt.x, yc - pt.y));
+                    }
                 }
             }
         }
@@ -1196,6 +1431,8 @@ struct weight_kernel {
     int num_samples_y;
     uint64_t seed;
     bool use_prefiltering;
+    // Optional: d(weight_image)/d(filter radius), for the radius gradient
+    float *d_weight_image;
 };
 
 // We use a "mega kernel" for rendering
@@ -1297,15 +1534,17 @@ struct render_kernel {
                                 d_render_image[4 * (yy * width + xx) + 2],
                                 d_render_image[4 * (yy * width + xx) + 3],
                             };
-                            auto d_weight =
-                                (dot(d_pixel, color) * weight_sum -
-                                 filter_weight * dot(d_pixel, color) * (weight_sum - filter_weight)) /
-                                square(weight_sum);
-                            d_compute_filter_weight(*scene.filter,
-                                                    xc - pt.x,
-                                                    yc - pt.y,
-                                                    d_weight,
-                                                    scene.d_filter);
+                            // pixel = \sum_i w_i c_i / W, W = \sum_i w_i, so
+                            // d pixel / d r = \sum_i (c_i - pixel) w_i' / W.
+                            // The -pixel term, \sum_i pixel w_i' / W = pixel W' / W
+                            // with pixel = \sum_i w_i c_i / W, is distributed over
+                            // the samples: each contributes c_i w_i W' / W^2, where
+                            // W' = d_weight_image (d W / d r, from weight_kernel).
+                            auto dpc = dot(d_pixel, color);
+                            auto d_radius = dpc / weight_sum *
+                                (filter_weight_d_radius(*scene.filter, xc - pt.x, yc - pt.y) -
+                                 filter_weight * d_weight_image[yy * width + xx] / weight_sum);
+                            atomic_add(scene.d_filter->radius, d_radius);
                         }
                     }
                 }
@@ -1350,6 +1589,8 @@ struct render_kernel {
     uint64_t seed;
     bool use_prefiltering;
     float *eval_positions;
+    // d(weight_image)/d(filter radius); required when d_render_image is given
+    float *d_weight_image;
 };
 
 struct BoundarySample {
@@ -1385,7 +1626,9 @@ struct sample_boundary_kernel {
         assert(shape_id >= 0 && shape_id < scene.num_shapes);
         auto shape_group_id = scene.sample_group_id[sample_id];
         assert(shape_group_id >= 0 && shape_group_id < scene.num_shape_groups);
-        auto shape_pmf = scene.sample_shapes_pmf[shape_id];
+        // sample_shapes_pmf is indexed by sample id (group membership order),
+        // not by shape id -- see build_shape_cdfs.
+        auto shape_pmf = scene.sample_shapes_pmf[sample_id];
         if (shape_pmf <= 0) {
             return;
         }
@@ -1590,6 +1833,21 @@ void render(std::shared_ptr<Scene> scene,
             memset(weight_image, 0, width * height * sizeof(float));
         }
     }
+    // d(weight_image)/d(filter radius), needed by the filter radius gradient
+    float *d_weight_image = nullptr;
+    if (weight_image != nullptr && d_render_image.get() != nullptr) {
+        if (scene->use_gpu) {
+#ifdef __CUDACC__
+            checkCuda(cudaMallocManaged(&d_weight_image, width * height * sizeof(float)));
+            cudaMemset(d_weight_image, 0, width * height * sizeof(float));
+#else
+            assert(false);
+#endif
+        } else {
+            d_weight_image = (float*)malloc(width * height * sizeof(float));
+            memset(d_weight_image, 0, width * height * sizeof(float));
+        }
+    }
 
     if (render_image.get() != nullptr || d_render_image.get() != nullptr ||
         render_sdf.get() != nullptr || d_render_sdf.get() != nullptr) {
@@ -1601,7 +1859,11 @@ void render(std::shared_ptr<Scene> scene,
                 height,
                 num_samples_x,
                 num_samples_y,
-                seed
+                seed,
+                // sample positions must match render_kernel (pixel centres
+                // when prefiltering)
+                use_prefiltering,
+                d_weight_image
             }, width * height * num_samples_x * num_samples_y, scene->use_gpu);
         }
 
@@ -1623,12 +1885,17 @@ void render(std::shared_ptr<Scene> scene,
             num_samples_y,
             seed,
             use_prefiltering,
-            eval_positions.get()
+            eval_positions.get(),
+            d_weight_image
         }, num_samples, scene->use_gpu);
     }
 
     // Boundary sampling
-    if (!use_prefiltering && d_render_image.get() != nullptr) {
+    // (no edge sampling for empty scenes or scenes whose boundaries have zero
+    // total length: build_shape_cdfs leaves the sampling tables at zero)
+    if (!use_prefiltering && d_render_image.get() != nullptr &&
+            scene->num_total_shapes > 0 &&
+            scene->sample_shapes_cdf[scene->num_total_shapes - 1] > 0) {
         auto num_samples = width * height * num_samples_x * num_samples_y;
         BoundarySample *boundary_samples = nullptr;
         int *boundary_ids = nullptr; // for sorting
@@ -1701,11 +1968,13 @@ void render(std::shared_ptr<Scene> scene,
     if (scene->use_gpu) {
 #ifdef __CUDACC__
         checkCuda(cudaFree(weight_image));
+        checkCuda(cudaFree(d_weight_image));
 #else
         assert(false);
 #endif
     } else {
         free(weight_image);
+        free(d_weight_image);
     }
 
     if (scene->use_gpu) {
@@ -1857,6 +2126,18 @@ PYBIND11_MODULE(diffvg, m) {
         .def("get_d_shape", &Scene::get_d_shape)
         .def("get_d_shape_group", &Scene::get_d_shape_group)
         .def("get_d_filter_radius", &Scene::get_d_filter_radius)
+        .def("export_flat", [](const Scene &scene) {
+            std::vector<int> ip, ints;
+            std::vector<float> floats;
+            scene.export_flat(ip, ints, floats);
+            py::array_t<int32_t> ip_arr((py::ssize_t)ip.size());
+            py::array_t<int32_t> ints_arr((py::ssize_t)ints.size());
+            py::array_t<float> floats_arr((py::ssize_t)floats.size());
+            std::memcpy(ip_arr.mutable_data(), ip.data(), ip.size() * sizeof(int32_t));
+            std::memcpy(ints_arr.mutable_data(), ints.data(), ints.size() * sizeof(int32_t));
+            std::memcpy(floats_arr.mutable_data(), floats.data(), floats.size() * sizeof(float));
+            return py::make_tuple(ip_arr, ints_arr, floats_arr);
+        }, "Flattened scene pools for the Metal kernels: (ip int32[64], ints int32[>=64], floats float32[>=64])")
         .def_readonly("num_shapes", &Scene::num_shapes)
         .def_readonly("num_shape_groups", &Scene::num_shape_groups);
 

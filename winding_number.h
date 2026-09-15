@@ -41,16 +41,196 @@ bool intersect(const AABB &box, const Vector2f &pt) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Crossing rule for the path winding number (mirrored by winding_number_path
+// in pydiffvg/metal/geometry.metal, which runs the same algorithm in float32).
+//
+// A horizontal ray {y = pt.y, x > pt.x} is intersected with y-monotone curve
+// pieces under a HALF-OPEN rule: a piece from value ya to yb crosses the ray
+// iff (ya <= pt.y) != (yb <= pt.y); it contributes +1 if it starts below
+// (it runs upwards in y) and -1 otherwise, provided the crossing lies right
+// of pt. A segment END POINT is classified from the stored point
+// (p.y <= pt.y) with no arithmetic, so two segments sharing a vertex classify
+// it identically: a ray through (or within float noise of) a vertex is counted
+// once for a crossing and zero or two times (with opposite signs) for a touch,
+// independent of root finding. Curves are split at the roots of y'(t) into
+// y-monotone pieces; the value at a split point is evaluated once and its
+// classification is shared by the two pieces it separates. Errors in the split
+// values or in the root location only matter for points within float noise of
+// the curve.
+
+// Cubic Bernstein polynomial and its derivative.
+DEVICE
+inline double wn_bez3_eval_d(const double c[4], double t, double &d) {
+    double s = 1 - t;
+    double a0 = s * c[0] + t * c[1];
+    double a1 = s * c[1] + t * c[2];
+    double a2 = s * c[2] + t * c[3];
+    double b0 = s * a0 + t * a1;
+    double b1 = s * a1 + t * a2;
+    d = 3 * (b1 - b0);
+    return s * b0 + t * b1;
+}
+
+// Roots of a0 t^2 + a1 t + a2 = 0 strictly inside (0, 1), sorted.
+DEVICE
+inline int wn_quadratic_roots01(double a0, double a1, double a2, double &r0, double &r1) {
+    int n = 0;
+    double t0 = 0, t1 = 0;
+    if (a0 == 0) {
+        if (fabs(a2) < fabs(a1)) {
+            t0 = -a2 / a1;
+            n = 1;
+        }
+    } else {
+        double disc = a1 * a1 - 4 * a0 * a2;
+        if (disc >= 0) {
+            double sq = sqrt(disc);
+            double q = a1 < 0 ? -0.5 * (a1 - sq) : -0.5 * (a1 + sq);
+            if (fabs(q) < fabs(a0)) {
+                t0 = q / a0;
+                n = 1;
+            }
+            if (fabs(a2) < fabs(q)) {
+                if (n == 0) {
+                    t0 = a2 / q;
+                } else {
+                    t1 = a2 / q;
+                }
+                n++;
+            }
+        }
+    }
+    int m = 0;
+    r0 = 0;
+    r1 = 0;
+    if (n > 0 && t0 > 0 && t0 < 1) {
+        r0 = t0;
+        m = 1;
+    }
+    if (n > 1 && t1 > 0 && t1 < 1) {
+        if (m == 0) {
+            r0 = t1;
+            m = 1;
+        } else if (t1 != r0) {
+            if (t1 < r0) {
+                r1 = r0;
+                r0 = t1;
+            } else {
+                r1 = t1;
+            }
+            m = 2;
+        }
+    }
+    return m;
+}
+
+// Root of the cubic Bernstein polynomial c on [lo, hi], where c is monotone and
+// changes classification (c <= 0) between lo and hi; below_lo is the
+// classification at lo. Safeguarded Newton on a shrinking bracket.
+DEVICE
+inline double wn_bez3_piece_root(const double c[4], double lo, double hi,
+                                 double ylo, double yhi, bool below_lo) {
+    double u = 0.5 * (lo + hi);
+    double den = ylo - yhi;
+    if (fabs(ylo) < fabs(den)) {
+        double r = ylo / den;
+        if (r > 0 && r < 1) {
+            u = lo + r * (hi - lo);
+        }
+    }
+    for (int it = 0; it < 100; it++) {
+        double du = 0;
+        double fu = wn_bez3_eval_d(c, u, du);
+        if (fu == 0) {
+            return u;
+        }
+        if ((fu <= 0) == below_lo) {
+            lo = u;
+        } else {
+            hi = u;
+        }
+        double mid = 0.5 * (lo + hi);
+        if (!(mid > lo && mid < hi)) {
+            return u;
+        }
+        double un = mid;
+        if (fabs(fu) < fabs(du) * (hi - lo)) {
+            double nt = u - fu / du;
+            if (nt > lo && nt < hi) {
+                un = nt;
+            }
+        }
+        if (fabs(un - u) < 1e-15) {
+            return un;
+        }
+        u = un;
+    }
+    return u;
+}
+
+// Signed crossings of the cubic Bezier with Bernstein coefficients y, x
+// (relative to the query point) with the ray {y = 0, x > 0}. below0 / below3
+// classify the end points and must come from the stored points.
+DEVICE
+inline int wn_cubic_crossings(const double y[4], const double x[4], bool below0, bool below3) {
+    double xmax = std::max(std::max(x[0], x[1]), std::max(x[2], x[3]));
+    if (!(xmax > 0)) {
+        return 0;
+    }
+    bool x_all_right = std::min(std::min(x[0], x[1]), std::min(x[2], x[3])) > 0;
+    double d0 = y[1] - y[0];
+    double d1 = y[2] - y[1];
+    double d2 = y[3] - y[2];
+    double e[2];
+    int ne = wn_quadratic_roots01(d0 - 2 * d1 + d2, 2 * (d1 - d0), d0, e[0], e[1]);
+    double ts[4], ys[4];
+    bool bs[4];
+    ts[0] = 0;
+    ys[0] = y[0];
+    bs[0] = below0;
+    int n = 1;
+    for (int k = 0; k < ne; k++) {
+        double dd = 0;
+        double yk = wn_bez3_eval_d(y, e[k], dd);
+        ts[n] = e[k];
+        ys[n] = yk;
+        bs[n] = yk <= 0;
+        n++;
+    }
+    ts[n] = 1;
+    ys[n] = y[3];
+    bs[n] = below3;
+    n++;
+    int winding = 0;
+    for (int k = 0; k + 1 < n; k++) {
+        if (bs[k] == bs[k + 1]) {
+            continue;
+        }
+        bool right = x_all_right;
+        if (!right) {
+            double u = wn_bez3_piece_root(y, ts[k], ts[k + 1], ys[k], ys[k + 1], bs[k]);
+            double dx = 0;
+            right = wn_bez3_eval_d(x, u, dx) > 0;
+        }
+        if (right) {
+            winding += bs[k] ? 1 : -1;
+        }
+    }
+    return winding;
+}
+
 DEVICE
 int compute_winding_number(const Path &path, const BVHNode *bvh_nodes, const Vector2f &pt) {
     // Shoot a horizontal ray from pt to right, intersect with all curves of the path,
-    // count intersection
+    // count intersection (half-open rule, see wn_cubic_crossings)
     auto num_segments = path.num_base_points;
     constexpr auto max_bvh_size = 128;
     int bvh_stack[max_bvh_size];
     auto stack_size = 0;
     auto winding_number = 0;
     bvh_stack[stack_size++] = 2 * num_segments - 2;
+    const double px = pt.x, py = pt.y;
     while (stack_size > 0) {
         const BVHNode &node = bvh_nodes[bvh_stack[--stack_size]];
         if (node.child1 < 0) {
@@ -65,55 +245,34 @@ int compute_winding_number(const Path &path, const BVHNode *bvh_nodes, const Vec
                 auto i1 = (point_id + 1) % path.num_points;
                 auto p0 = Vector2f{path.points[2 * i0], path.points[2 * i0 + 1]};
                 auto p1 = Vector2f{path.points[2 * i1], path.points[2 * i1 + 1]};
-                // intersect p0 + t * (p1 - p0) with pt + t' * (1, 0)
-                // solve:
-                // pt.x + t' = v0.x + t * (v1.x - v0.x)
-                // pt.y      = v0.y + t * (v1.y - v0.y)
-                if (p1.y != p0.y) {
-                    auto t = (pt.y - p0.y) / (p1.y - p0.y);
-                    if (t >= 0 && t <= 1) {
-                        auto tp = p0.x - pt.x + t * (p1.x - p0.x);
-                        if (tp >= 0) {
-                            if (p1.y - p0.y > 0) {
-                                winding_number += 1;
-                            } else {
-                                winding_number -= 1;
-                            }
-                        }
+                bool b0 = p0.y <= pt.y;
+                bool b1 = p1.y <= pt.y;
+                if (b0 != b1) {
+                    // crossing x >= pt.x  <=>  sign(cross) matches the direction
+                    double q0x = p0.x - px, q0y = p0.y - py;
+                    double q1x = p1.x - px, q1y = p1.y - py;
+                    double cr = q0x * q1y - q0y * q1x;
+                    if (b0 ? cr >= 0 : cr <= 0) {
+                        winding_number += b0 ? 1 : -1;
                     }
                 }
             } else if (path.num_control_points[base_point_id] == 1) {
-                // Quadratic Bezier curve
+                // Quadratic Bezier curve, degree-elevated to a cubic (end points unchanged)
                 auto i0 = point_id;
                 auto i1 = point_id + 1;
                 auto i2 = (point_id + 2) % path.num_points;
                 auto p0 = Vector2f{path.points[2 * i0], path.points[2 * i0 + 1]};
                 auto p1 = Vector2f{path.points[2 * i1], path.points[2 * i1 + 1]};
                 auto p2 = Vector2f{path.points[2 * i2], path.points[2 * i2 + 1]};
-                // The curve is (1-t)^2p0 + 2(1-t)tp1 + t^2p2
-                // = (p0-2p1+p2)t^2+(-2p0+2p1)t+p0
-                // intersect with pt + t' * (1 0)
-                // solve
-                // pt.y = (p0-2p1+p2)t^2+(-2p0+2p1)t+p0
-                float t[2];
-                if (solve_quadratic(p0.y-2*p1.y+p2.y,
-                                    -2*p0.y+2*p1.y,
-                                    p0.y-pt.y,
-                                    &t[0], &t[1])) {
-                    for (int j = 0; j < 2; j++) {
-                        if (t[j] >= 0 && t[j] <= 1) {
-                            auto tp = (p0.x-2*p1.x+p2.x)*t[j]*t[j] +
-                                      (-2*p0.x+2*p1.x)*t[j] +
-                                      p0.x-pt.x;
-                            if (tp >= 0) {
-                                if (2*(p0.y-2*p1.y+p2.y)*t[j]+(-2*p0.y+2*p1.y) > 0) {
-                                    winding_number += 1;
-                                } else {
-                                    winding_number -= 1;
-                                }
-                            }
-                        }
-                    }
+                bool b0 = p0.y <= pt.y;
+                bool b1 = p1.y <= pt.y;
+                bool b2 = p2.y <= pt.y;
+                if (!(b0 == b1 && b1 == b2)) {
+                    double q0x = p0.x - px, q1x = p1.x - px, q2x = p2.x - px;
+                    double q0y = p0.y - py, q1y = p1.y - py, q2y = p2.y - py;
+                    double cy[4] = {q0y, (q0y + 2 * q1y) / 3, (2 * q1y + q2y) / 3, q2y};
+                    double cx[4] = {q0x, (q0x + 2 * q1x) / 3, (2 * q1x + q2x) / 3, q2x};
+                    winding_number += wn_cubic_crossings(cy, cx, b0, b2);
                 }
             } else if (path.num_control_points[base_point_id] == 2) {
                 // Cubic Bezier curve
@@ -125,34 +284,14 @@ int compute_winding_number(const Path &path, const BVHNode *bvh_nodes, const Vec
                 auto p1 = Vector2f{path.points[2 * i1], path.points[2 * i1 + 1]};
                 auto p2 = Vector2f{path.points[2 * i2], path.points[2 * i2 + 1]};
                 auto p3 = Vector2f{path.points[2 * i3], path.points[2 * i3 + 1]};
-                // The curve is (1 - t)^3 p0 + 3 * (1 - t)^2 t p1 + 3 * (1 - t) t^2 p2 + t^3 p3
-                // = (-p0+3p1-3p2+p3) t^3 + (3p0-6p1+3p2) t^2 + (-3p0+3p1) t + p0
-                // intersect with pt + t' * (1 0)
-                // solve:
-                // pt.y = (-p0+3p1-3p2+p3) t^3 + (3p0-6p1+3p2) t^2 + (-3p0+3p1) t + p0
-                double t[3];
-                int num_sol = solve_cubic(double(-p0.y+3*p1.y-3*p2.y+p3.y),
-                                          double(3*p0.y-6*p1.y+3*p2.y),
-                                          double(-3*p0.y+3*p1.y),
-                                          double(p0.y-pt.y),
-                                          t);
-                for (int j = 0; j < num_sol; j++) {
-                    if (t[j] >= 0 && t[j] <= 1) {
-                        // t' = (-p0+3p1-3p2+p3) t^3 + (3p0-6p1+3p2) t^2 + (-3p0+3p1) t + p0 - pt.x
-                        auto tp = (-p0.x+3*p1.x-3*p2.x+p3.x)*t[j]*t[j]*t[j]+
-                                  (3*p0.x-6*p1.x+3*p2.x)*t[j]*t[j]+
-                                  (-3*p0.x+3*p1.x)*t[j]+
-                                  p0.x-pt.x;
-                        if (tp > 0) {
-                            if (3*(-p0.y+3*p1.y-3*p2.y+p3.y)*t[j]*t[j]+
-                                2*(3*p0.y-6*p1.y+3*p2.y)*t[j]+
-                                (-3*p0.y+3*p1.y) > 0) {
-                                winding_number += 1;
-                            } else {
-                                winding_number -= 1;
-                            }
-                        }
-                    }
+                bool b0 = p0.y <= pt.y;
+                bool b1 = p1.y <= pt.y;
+                bool b2 = p2.y <= pt.y;
+                bool b3 = p3.y <= pt.y;
+                if (!(b0 == b1 && b1 == b2 && b2 == b3)) {
+                    double cy[4] = {p0.y - py, p1.y - py, p2.y - py, p3.y - py};
+                    double cx[4] = {p0.x - px, p1.x - px, p2.x - px, p3.x - px};
+                    winding_number += wn_cubic_crossings(cy, cx, b0, b3);
                 }
             } else {
                 assert(false);
