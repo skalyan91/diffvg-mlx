@@ -3,7 +3,7 @@ Differentiable Rasterizer for Vector Graphics, ported to [MLX](https://github.co
 
 diffvg is a differentiable rasterizer for 2D vector graphics: it renders circles, ellipses, rectangles, polygons and Bézier paths with solid or gradient fills, and computes gradients of the image with respect to the scene parameters. See the [project page](https://people.csail.mit.edu/tzumao/diffvg) for more information.
 
-This repository is a fork of [BachiLi/diffvg](https://github.com/BachiLi/diffvg) by Tzu-Mao Li and colleagues. All credit for the rasterizer and the algorithms goes to the original authors. The fork **replaces the PyTorch and TensorFlow bindings** with MLX bindings for Apple Silicon. The C++ core renders on the CPU with its own thread pool; the MLX layer passes scene data to the core and exposes rendering as a differentiable MLX function.
+This repository is a fork of [BachiLi/diffvg](https://github.com/BachiLi/diffvg) by Tzu-Mao Li and colleagues. All credit for the rasterizer and the algorithms goes to the original authors. The fork **replaces the PyTorch and TensorFlow bindings** with MLX bindings for Apple Silicon, and **renders on the Apple GPU**: the forward and backward passes run in Metal compute kernels, with the original C++ core kept as a CPU backend. Rendering is exposed as a differentiable MLX function.
 
 ![teaser](https://user-images.githubusercontent.com/951021/92184822-2a0bc500-ee20-11ea-81a6-f26af2d120f4.jpg)
 
@@ -113,12 +113,32 @@ Results go to `apps/results/`. Scripts that assemble a video from the iterations
 
 # Notes on the MLX port
 - `pydiffvg.RenderFunction.apply` keeps the call pattern of the PyTorch version, so existing scripts port by swapping tensors for `mx.array`s. `RenderFunction.apply` is the same function as `pydiffvg.render`, a differentiable function built with `mx.custom_function`. `RenderFunction.render_grad` returns the screen-space translation gradient image.
-- **Rendering runs on the CPU only.** The CUDA code path is not built, `pydiffvg.get_device()` returns `mx.cpu`, and `pydiffvg.set_use_gpu(True)` raises `NotImplementedError`.
+- **The GPU backend is the default** whenever Metal is available (`mx.metal.is_available()`). Call `pydiffvg.set_use_gpu(False)` to use the C++ CPU core instead, and `pydiffvg.get_use_gpu()` to check the current backend. See "GPU backend" below. The CUDA code path is not built.
 - MLX arrays cannot be updated in place: instead of `x.data.clamp_()` or `x += eps`, compute a new array and assign it back to the shape.
 - `refine_svg.py` supports only the MSE loss. The `--use_lpips_loss` flag of upstream relies on `ttools` (PyTorch), so the flag has been removed.
 - These apps depend heavily on PyTorch models or libraries and have been removed: `painterly_rendering.py`, `sketch_gan.py`, `style_transfer.py`, `texture_synthesis.py`, `seam_carving.py`, `gaussian_blur.py` and `optimize_pixel_filter.py`. The TensorFlow bindings (`pydiffvg_tensorflow/`) and the `*_tf.py` apps have been removed with TensorFlow support. The vector VAE and GAN code in `apps/generative_models/` has been removed for the same reason.
 - Extra packages for some apps: `matplotlib` for the colormaps of `image_compare.py` (the other comparison scripts fall back to a built-in colormap), `pygame` and `tkinter` for `svg_brush.py`, and `Pillow` for `simple_transform_svg.py`.
 - `pydiffvg.save_svg` writes a shape group with several subpaths as a single `<path>` element (a compound path), with one `M` command per subpath. Each closed subpath ends with `z`, and the element carries the fill rule of the shape group.
+
+# GPU backend
+The C++ core still builds the scene (bounding volume hierarchies and sampling tables) on the CPU and exports it as flat arrays; Metal kernels, compiled at run time with `mx.fast.metal_kernel`, then do all the per-sample work:
+- colour rendering with area sampling, its gradients (interior and boundary terms) and `RenderFunction.render_grad`;
+- prefiltered colour rendering and its gradients;
+- signed distance output, also at `eval_positions`, and its gradients.
+
+Timings on an Apple M5 (warm runs, including scene construction in C++; "gradients" is `mx.value_and_grad` with respect to every float parameter of the scene):
+
+| Scene | Output | Samples per pixel | CPU forward | GPU forward | CPU gradients | GPU gradients |
+|---|---|---|---|---|---|---|
+| `tiger.svg` (495×510) | colour | 4 | 1.12 s | 0.042 s | 9.51 s | 0.198 s |
+| `tiger.svg` | colour | 16 | 4.77 s | 0.103 s | 36.3 s | 0.645 s |
+| `tiger.svg` | prefiltered colour | 1 | 1.81 s | 0.036 s | 3.77 s | 0.076 s |
+| `tiger.svg` | signed distance | 1 | 75.4 s | 0.073 s | 146 s | 0.139 s |
+| `hawaii.svg` (3110×2563) | colour | 4 | 71.9 s | 2.39 s | 510 s | 12.3 s |
+
+Colour output at `eval_positions` is not supported by either backend. The GPU uses the same random sample positions as the CPU, so forward renders agree up to float32 rounding: pixels whose sample lies within about 1e-6 px of an edge can switch coverage. Gradients agree with the CPU within Monte Carlo noise and with finite differences.
+
+The GPU kernels have no `double`, so the root finders for cubic Bézier winding numbers, closest points and stroke distances, and for ellipse closest points, use float32 formulations in a curve-local frame. Both backends share a half-open rule for curve crossings at shared vertices and a Bernstein root finder for cubic closest points.
 
 # Upstream bugs fixed in this fork
 Rendering and gradients (C++ core):
@@ -128,6 +148,14 @@ Rendering and gradients (C++ core):
 - **Stroked ellipses** failed an assertion.
 - Stroke gradients now sample round joins and caps and use the speed of the stroke outline rather than that of the centreline. The gradients of stroked circles, ellipses and rectangles match finite differences to within a few percent; stroked paths with sharp joins can still deviate by 10–20% on small entries.
 - Boundary samples on a pixel border are no longer counted in both pixels, which had doubled the gradients of pixel-aligned rectangles.
+- **Edge sampling** picked the probability of a shape by shape index instead of by sample index, which scaled edge gradients (0.5 and 2 times in a two-circle test) whenever shape groups list shapes out of order.
+- **Cubic Bézier distances** divided by a leading coefficient that is zero for straight segments written as cubics (so such strokes were not drawn) and missed roots on ordinary cubics (distance errors of 10–260 px). A Bernstein-form root finder replaces the solver.
+- **Closest-point gradients** were zero for the control points of quadratic curves, omitted a term for lines, and were 15–27% off for cubics under non-uniform transforms.
+- **Winding numbers** could flip far from any edge when a sample row passed within float noise of a vertex shared by two curves.
+- The **filter-radius gradient** was wrong by factors of 10² to 10⁷ (wrong normalisation derivative and wrong filter derivatives), and the **background-image gradient** kept only one sample per pixel.
+- Strokes with **per-point thickness** used the wrong boundary normal, were culled too early by the scene hierarchy, and vanished entirely with prefiltering.
+- Prefiltering computed its pixel weights from random sample positions instead of pixel centres.
+- **Empty scenes** crashed, zero-length paths produced NaN sampling tables, and a zero-length closed polygon had a distance of 0 everywhere.
 
 SVG parsing (`pydiffvg.svg_to_scene`) and saving (`pydiffvg.save_svg`):
 - **Radial gradients** take their centre and radius from `cx`, `cy` and `r`, with support for percentages, `gradientUnits` and `gradientTransform`. Before, the centre was always zero and the radius came from the focal attributes. Focal points (`fx`, `fy`, `fr`) and `spreadMethod="reflect"`/`"repeat"` are still not supported; the parser warns when it meets them.

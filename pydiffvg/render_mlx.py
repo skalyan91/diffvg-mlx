@@ -398,9 +398,14 @@ def _forward(width, height, num_samples_x, num_samples_y, seed, background_image
         'scene' so that the backward pass can reuse it.
     """
     built = _build_scene(args)
-    scene, output_type, use_prefiltering, eval_positions, keep_alive = built
     if scene_cache is not None:
         scene_cache['scene'] = built
+    return _forward_built(width, height, num_samples_x, num_samples_y, seed,
+                          background_image, built)
+
+def _forward_built(width, height, num_samples_x, num_samples_y, seed, background_image, built):
+    """ CPU forward pass on an already built scene (see _build_scene). """
+    scene, output_type, use_prefiltering, eval_positions, keep_alive = built
 
     if output_type == OutputType.color:
         assert(eval_positions.shape[0] == 0)
@@ -439,6 +444,111 @@ def _forward(width, height, num_samples_x, num_samples_y, seed, background_image
     if print_timing:
         print('Forward pass, time: %.5f s' % time_elapsed)
     return mx.array(rendered_image)
+
+def _gpu_mode(args):
+    """
+        Backend decision for serialized scene args on the GPU: 'color',
+        'prefiltered' or 'sdf' (Metal kernels), or None (CPU core). Colour
+        output at eval_positions is unsupported by the CPU core too, so it
+        stays on the CPU (which asserts).
+    """
+    output_type, use_prefiltering, eval_positions = args[4], args[5], args[6]
+    if output_type == OutputType.sdf:
+        return 'sdf'
+    if eval_positions is not None and eval_positions.shape[0] > 0:
+        return None
+    return 'prefiltered' if use_prefiltering else 'color'
+
+def _eval_positions_arg(args):
+    ev = args[6]
+    return ev if ev is not None and ev.shape[0] > 0 else None
+
+def _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args,
+                 built = None):
+    """
+        Builds the C++ scene (unless `built` is given) and exports its pools.
+        Returns {'scene': built, 'flat': prepare_flat dict} for 'color', or
+        {'scene': built, 'pools': (ip, ints, floats)} for 'sdf' / 'prefiltered'.
+    """
+    from . import render_metal
+    from . import render_metal_stage3 as r3
+    if built is None:
+        built = _build_scene(args)
+    if mode == 'color':
+        built, flat = render_metal.prepare_scene_gpu(args, width, height, num_samples_x,
+                                                     num_samples_y, seed, background_image, built)
+        assert flat is not None
+        return {'scene': built, 'flat': flat}
+    ip, ints, floats, built = r3.flat_scene(args, built)
+    return {'scene': built, 'pools': (ip, ints, floats)}
+
+def _forward_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args,
+                 scene_cache):
+    """ Metal forward pass; caches the scene and pools in scene_cache for the vjp. """
+    from . import render_metal
+    from . import render_metal_stage3 as r3
+    prepared = _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
+                            background_image, args)
+    scene_cache.update(prepared)
+    if mode == 'color':
+        return render_metal.render_color_prepared(prepared['flat'])
+    ip, ints, floats = prepared['pools']
+    if mode == 'sdf':
+        return r3.sdf_forward_flat(ip, ints, floats, width, height, num_samples_x, num_samples_y,
+                                   seed, _eval_positions_arg(args), bool(args[5]))
+    return r3.prefiltered_forward_flat(ip, ints, floats, width, height, num_samples_x,
+                                       num_samples_y, seed, background_image)
+
+def _backward_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image, args,
+                  grad_img, render_image, scene_cache):
+    """
+        Metal backward pass. Returns gradients aligned with
+        [background_image] + args (None for non-differentiable entries).
+        render_image: the forward output (prefiltered filter-radius gradient).
+        scene_cache: the forward pass's cache (rebuilt when empty).
+    """
+    from . import render_metal
+    from . import render_metal_stage3 as r3
+    key = 'flat' if mode == 'color' else 'pools'
+    prepared = scene_cache if key in scene_cache else \
+        _prepare_gpu(mode, width, height, num_samples_x, num_samples_y, seed, background_image,
+                     args, scene_cache.get('scene'))
+    if mode == 'color':
+        flat = prepared['flat']
+        d_floats, d_bg, _ = render_metal.render_backward_prepared(flat, grad_img)
+        ip, ints = flat['ip'], flat['ints']
+    else:
+        ip, ints, floats = prepared['pools']
+        if mode == 'sdf':
+            d_floats, _ = r3.sdf_backward_flat(ip, ints, floats, width, height, num_samples_x,
+                                               num_samples_y, seed, grad_img,
+                                               _eval_positions_arg(args), False, bool(args[5]))
+            d_bg = None
+        else:
+            d_floats, d_bg, _ = r3.prefiltered_backward_flat(
+                ip, ints, floats, width, height, num_samples_x, num_samples_y, seed,
+                background_image, grad_img, render_image = render_image)
+    return [d_bg] + render_metal.grads_from_d_floats({'ip': ip, 'ints': ints}, args, d_floats)
+
+def _render_grad_gpu(mode, grad_img, width, height, num_samples_x, num_samples_y, seed,
+                     background_image, args):
+    """ Screen-space translation gradient image (height, width, 2) on Metal. """
+    from . import render_metal
+    from . import render_metal_stage3 as r3
+    if mode == 'color':
+        return render_metal.render_grad_gpu(grad_img, args, width, height, num_samples_x,
+                                            num_samples_y, seed, background_image)
+    ip, ints, floats, _ = r3.flat_scene(args)
+    if mode == 'sdf':
+        _, d_tr = r3.sdf_backward_flat(ip, ints, floats, width, height, num_samples_x,
+                                       num_samples_y, seed, grad_img, _eval_positions_arg(args),
+                                       True, bool(args[5]))
+    else:
+        _, _, d_tr = r3.prefiltered_backward_flat(ip, ints, floats, width, height, num_samples_x,
+                                                  num_samples_y, seed, background_image, grad_img,
+                                                  want_translation = True)
+    mx.eval(d_tr)
+    return d_tr
 
 def _backward(width, height, num_samples_x, num_samples_y, seed, background_image, args, grad_img,
               built = None):
@@ -615,23 +725,43 @@ def render(width,
 
     # The scene built by the forward pass is reused (once) by the backward
     # pass for the same inputs, instead of unpacking the arguments again.
+    # GPU passes also cache the exported pools ('pools' / 'flat') and the
+    # backend decision ('mode') so forward and vjp stay consistent.
     scene_cache = {}
 
     @mx.custom_function
     def _render(*arrays):
         full = substitute(arrays)
         scene_cache.clear()
-        return _forward(width, height, num_samples_x, num_samples_y, seed,
-                        full[0], full[1:], scene_cache)
+        mode = _gpu_mode(full[1:]) if pydiffvg.get_use_gpu() else None
+        scene_cache['mode'] = mode
+        if mode is None:
+            return _forward(width, height, num_samples_x, num_samples_y, seed,
+                            full[0], full[1:], scene_cache)
+        return _forward_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
+                            full[0], full[1:], scene_cache)
 
     @_render.vjp
     def _render_vjp(primals, cotangent, output):
         if isinstance(cotangent, (list, tuple)):
             cotangent = cotangent[0]
+        if isinstance(output, (list, tuple)):
+            output = output[0]
         full = substitute(primals)
-        built = scene_cache.pop('scene', None)
-        d_full = _backward(width, height, num_samples_x, num_samples_y, seed,
-                           full[0], full[1:], cotangent, built)
+        if 'mode' in scene_cache:
+            mode = scene_cache.pop('mode')
+        else:
+            # No cached forward (e.g. the vjp runs twice): current setting.
+            mode = _gpu_mode(full[1:]) if pydiffvg.get_use_gpu() else None
+        if mode is None:
+            built = scene_cache.pop('scene', None)
+            scene_cache.clear()
+            d_full = _backward(width, height, num_samples_x, num_samples_y, seed,
+                               full[0], full[1:], cotangent, built)
+        else:
+            d_full = _backward_gpu(mode, width, height, num_samples_x, num_samples_y, seed,
+                                   full[0], full[1:], cotangent, output, scene_cache)
+            scene_cache.clear()
         grads = []
         # Share one zero array per (shape, dtype) for non-differentiable inputs.
         zeros = {}
@@ -661,6 +791,13 @@ def render_grad(grad_img,
     """
         Returns the screen-space translation gradient image (height x width x 2).
     """
+    mode = _gpu_mode(args) if pydiffvg.get_use_gpu() else None
+    if mode is not None:
+        bg = background_image
+        if bg is not None and bg.shape[2] == 3:
+            bg = mx.concatenate([bg, mx.ones((bg.shape[0], bg.shape[1], 1))], axis = 2)
+        return _render_grad_gpu(mode, grad_img, width, height, num_samples_x, num_samples_y,
+                                seed, bg, args)
     scene, output_type, use_prefiltering, eval_positions, keep_alive = _build_scene(args)
     grad_img = _np(grad_img)
     assert(np.isfinite(grad_img).all())
