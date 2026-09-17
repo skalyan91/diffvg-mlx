@@ -3,7 +3,7 @@ Differentiable Rasterizer for Vector Graphics, ported to [MLX](https://github.co
 
 diffvg is a differentiable rasterizer for 2D vector graphics: it renders circles, ellipses, rectangles, polygons and Bézier paths with solid or gradient fills, and computes gradients of the image with respect to the scene parameters. See the [project page](https://people.csail.mit.edu/tzumao/diffvg) for more information.
 
-This repository is a fork of [BachiLi/diffvg](https://github.com/BachiLi/diffvg) by Tzu-Mao Li and colleagues. All credit for the rasterizer and the algorithms goes to the original authors. The fork **replaces the PyTorch and TensorFlow bindings** with MLX bindings for Apple Silicon, and **renders on the Apple GPU**: the forward and backward passes run in Metal compute kernels, with the original C++ core kept as a CPU backend. Rendering is exposed as a differentiable MLX function.
+This repository is a fork of [BachiLi/diffvg](https://github.com/BachiLi/diffvg) by Tzu-Mao Li and colleagues. All credit for the rasterizer and the algorithms goes to the original authors. The fork **replaces the PyTorch and TensorFlow bindings** with MLX bindings, and **renders on the GPU**: the forward and backward passes run in Metal compute kernels on Apple Silicon and in CUDA kernels on NVIDIA, with the original C++ core kept as a CPU backend. Rendering is exposed as a differentiable MLX function.
 
 ![teaser](https://user-images.githubusercontent.com/951021/92184822-2a0bc500-ee20-11ea-81a6-f26af2d120f4.jpg)
 
@@ -113,7 +113,7 @@ Results go to `apps/results/`. Scripts that assemble a video from the iterations
 
 # Notes on the MLX port
 - `pydiffvg.RenderFunction.apply` keeps the call pattern of the PyTorch version, so existing scripts port by swapping tensors for `mx.array`s. `RenderFunction.apply` is the same function as `pydiffvg.render`, a differentiable function built with `mx.custom_function`. `RenderFunction.render_grad` returns the screen-space translation gradient image.
-- **The GPU backend is the default** whenever Metal is available (`mx.metal.is_available()`). Call `pydiffvg.set_use_gpu(False)` to use the C++ CPU core instead, and `pydiffvg.get_use_gpu()` to check the current backend. See "GPU backend" below. The CUDA code path is not built.
+- **The GPU backend is the default** whenever a GPU is available (`mx.metal.is_available()` on Apple Silicon, `mx.cuda.is_available()` on NVIDIA). Call `pydiffvg.set_use_gpu(False)` to use the C++ CPU core instead, and `pydiffvg.get_use_gpu()` to check the current backend. See "GPU backend" below. The C++ core is built without CUDA on either platform; the NVIDIA GPU is driven by `mx.fast.cuda_kernel`, not by the CUDA code of upstream diffvg.
 - MLX arrays cannot be updated in place: instead of `x.data.clamp_()` or `x += eps`, compute a new array and assign it back to the shape.
 - `refine_svg.py` supports only the MSE loss. The `--use_lpips_loss` flag of upstream relies on `ttools` (PyTorch), so the flag has been removed.
 - These apps depend heavily on PyTorch models or libraries and have been removed: `painterly_rendering.py`, `sketch_gan.py`, `style_transfer.py`, `texture_synthesis.py`, `seam_carving.py`, `gaussian_blur.py` and `optimize_pixel_filter.py`. The TensorFlow bindings (`pydiffvg_tensorflow/`) and the `*_tf.py` apps have been removed with TensorFlow support. The vector VAE and GAN code in `apps/generative_models/` has been removed for the same reason.
@@ -121,7 +121,7 @@ Results go to `apps/results/`. Scripts that assemble a video from the iterations
 - `pydiffvg.save_svg` writes a shape group with several subpaths as a single `<path>` element (a compound path), with one `M` command per subpath. Each closed subpath ends with `z`, and the element carries the fill rule of the shape group.
 
 # GPU backend
-The scene itself is also built on the GPU: MLX operations pack shapes, colours and transforms into flat arrays and build the bounding volume hierarchies and sampling tables (`pydiffvg/scene_gpu.py`, `pydiffvg/scene_gpu_bvh.py`). The integer structure of the scene (shape types, control-point counts, group membership) is cached between calls, so an optimisation step only repacks the float parameters. Metal kernels, compiled at run time with `mx.fast.metal_kernel`, then do all the per-sample work:
+The scene itself is also built on the GPU: MLX operations pack shapes, colours and transforms into flat arrays and build the bounding volume hierarchies and sampling tables (`pydiffvg/scene_gpu.py`, `pydiffvg/scene_gpu_bvh.py`). The integer structure of the scene (shape types, control-point counts, group membership) is cached between calls, so an optimisation step only repacks the float parameters. GPU kernels, compiled at run time with `mx.fast.metal_kernel` or `mx.fast.cuda_kernel`, then do all the per-sample work:
 - colour rendering with area sampling, its gradients (interior and boundary terms) and `RenderFunction.render_grad`;
 - prefiltered colour rendering and its gradients;
 - signed distance output, also at `eval_positions`, and its gradients.
@@ -137,6 +137,25 @@ Timings on an Apple M5 (warm runs, including scene construction in C++; "gradien
 | `hawaii.svg` (3110×2563) | colour | 4 | 71.9 s | 2.39 s | 510 s | 12.3 s |
 
 Building the scene on the GPU matters most for scenes with many shapes: a forward render of `contour.svg` (53,242 shapes) takes 1.91 s instead of 5.72 s with the scene built by the C++ core, and 0.043 s instead of 0.053 s for `tiger.svg`.
+
+## NVIDIA GPUs
+The same kernels run on NVIDIA hardware through `mx.fast.cuda_kernel`. Each kernel body is written once, in a backend-neutral dialect (`pydiffvg/gpu_backend.py`); only the device helpers are translated per backend, so `pydiffvg/cuda/*.cu` mirrors `pydiffvg/metal/*.metal` file for file. The backend is detected automatically and can be forced with `pydiffvg.set_gpu_backend('metal' | 'cuda' | 'auto')`. Neither platform builds the CUDA code of upstream diffvg: the C++ core stays CPU-only and every GPU path goes through MLX.
+
+Bit parity with the C++ core needs different tools on each backend. Metal takes `#pragma METAL fp contract(off)` and a correctly rounded `sqrt` correction; nvrtc has no contraction pragma, so the CUDA sources use the `__fmul_rn` and `__fadd_rn` intrinsics, and its `sqrtf` is already correctly rounded.
+
+Measured against the C++ core on an RTX 3090 (`pydiffvg/cuda/README-porting.md` records what the translation has to preserve):
+
+| Check | Result |
+|---|---|
+| Colour, 2×2 and 4×4 samples | bit-identical |
+| `tiger.svg` (495×510), colour | 1.2e-07 maximum difference, no pixel past 1e-4 |
+| `tiger.svg`, prefiltered | 7.5e-05, no pixel past 1e-4 |
+| `hawaii.svg` (3110×2563), colour | 15 of 7,970,930 pixels past 1e-4, and none of them under a second seed |
+| Gradients (radius, centre, colour, stroke width) | agree to 1.8e-04 relative or better |
+
+The `hawaii.svg` outliers are edge samples landing on either side of coincident edges, not a difference in geometry: a different seed moves them, and no pixel diverges under both seeds. Prefiltered output is the one path that is not bit-identical on either backend (6.2e-06 on Metal, 7.5e-05 on CUDA); the cause has not been traced.
+
+A `mx.value_and_grad` step over a two-shape scene at 256×256 with 2×2 samples takes 8.9 ms on the RTX 3090 against 661.7 ms on that machine's CPU core.
 
 Options on the GPU backend:
 - `pydiffvg.set_gpu_scene_builder('cpu')` builds the scene with the C++ core instead (default `'gpu'`); results agree to float rounding.
