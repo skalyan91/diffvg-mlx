@@ -528,6 +528,20 @@ def set_scene_refit(enabled):
 def get_scene_refit():
     return _scene_refit
 
+def set_scene_build_device(device):
+    """
+        Where the GPU scene builder assembles the pools: 'auto' (default),
+        'cpu' or 'gpu' (the MLX stream, not the rendering backend). 'auto'
+        currently picks the GPU everywhere; see SCENE_BUILD_CPU_MAX_WORK in
+        pydiffvg/scene_gpu.py for the measurements behind that.
+    """
+    from . import scene_gpu
+    scene_gpu.set_scene_build_device(device)
+
+def get_scene_build_device():
+    from . import scene_gpu
+    return scene_gpu.get_scene_build_device()
+
 _scene_topology_trust = False
 
 def set_scene_topology_trust(enabled):

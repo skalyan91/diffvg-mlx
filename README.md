@@ -142,6 +142,7 @@ Options on the GPU backend:
 - `pydiffvg.set_gpu_scene_builder('cpu')` builds the scene with the C++ core instead (default `'gpu'`); results agree to float rounding.
 - `pydiffvg.set_scene_refit(False)` rebuilds the hierarchies on every call instead of refitting them when only float parameters change (default on; refitting is always correct but currently saves little time).
 - `pydiffvg.set_scene_topology_trust(True)` skips re-reading integer arrays (control-point counts, shape ids) that are the same objects as in the previous call. It is faster for very large scenes but **unsafe if you modify those arrays in place**, so it is off by default. Float parameters are always re-read, so in-place updates of points, colours and transforms are safe.
+- `pydiffvg.set_scene_build_device('cpu')` assembles the arrays on the CPU stream instead of the GPU one (default `'auto'`). Both give bit-identical arrays. `'auto'` currently chooses the GPU for every scene: on an Apple M5 the CPU stream was no faster even for a single shape, and much slower from about a thousand shapes, because arrays built on the CPU stream cannot queue ahead of the rendering kernels.
 - Shape groups with no shapes are supported by the GPU scene builder; the C++ core (CPU backend or `'cpu'` builder) raises an error for them.
 
 # Packed parameters

@@ -23,6 +23,18 @@
     (-ffp-contract=on on arm64: matrix.h inverse and xform_pt, the Ramanujan
     ellipse circumference), and the running sums (path length, path CDF,
     sample CDF) are sequential float32 loops in C++ order.
+
+    Everything is lazy: no call in the per-frame path evaluates an array, so
+    the pools are one MLX graph that the rasterisation kernels consume.
+    The pools can be assembled on either stream: set_scene_build_device('auto'
+    | 'cpu' | 'gpu'), where 'auto' decides from a structural size measure
+    (scene_build_work) without any sync. The five helper metal_kernels only
+    run on the GPU, so the CPU stream uses MLX-op equivalents that produce
+    bit-identical pools (see below). 'auto' currently keeps every scene on the
+    GPU stream: measured, the CPU stream never made a frame faster, because
+    the pools feed GPU kernels and building them on the other stream
+    serialises the two (see SCENE_BUILD_CPU_MAX_WORK for the numbers and for
+    re-enabling it).
 """
 import operator
 from collections import OrderedDict
@@ -34,7 +46,8 @@ import diffvg
 from . import scene_gpu_bvh as sgb
 
 __all__ = ['SceneTopology', 'topology_from_args', 'topology_signature', 'build_pools',
-           'build_pools_from_sources', 'sources_from_args', 'grad_index_map', 'clear_topology_cache']
+           'build_pools_from_sources', 'sources_from_args', 'grad_index_map', 'clear_topology_cache',
+           'set_scene_build_device', 'get_scene_build_device', 'scene_build_work']
 
 # ip slots (pydiffvg/metal/common.metal)
 IP_W, IP_H, IP_NSX, IP_NSY = 0, 1, 2, 3
@@ -411,6 +424,239 @@ def reset_kernel_cache():
 
 
 # ---------------------------------------------------------------------------
+# CPU-stream assembly
+#
+# mx.fast.metal_kernel only runs on the GPU ("[metal_kernel] Only supports the
+# GPU"), so the five helper kernels above have MLX-op equivalents used when the
+# pools are assembled on the CPU stream. They are bit-identical to the kernels:
+# - the C++ contractions that the kernels write as fma() are emulated in
+#   float64 (CPU-only dtype: one rounding, as fma), the inner products that C++
+#   rounds to float32 first are kept in float32;
+# - CPU sqrt is correctly rounded (Metal's is not, hence sg_sqrt there);
+# - the sequential float32 running sums (path length, path CDF) are cumsum over
+#   a (paths, max segments) matrix zero-padded on the right, and the sample CDF
+#   is a 1-D cumsum: MLX's CPU cumsum is sequential, so the rounding matches
+#   (the GPU's is not, hence the kernels).
+
+_scene_build_device = 'auto'
+
+# 'auto' threshold on the work measure (points + segments + shapes + groups +
+# members): the CPU stream is used when the work is at most this, 0 disables it.
+#
+# MEASURED (scratchpad/lazycpu, paired samples alternating CPU/GPU per
+# repetition, median paired difference + sign test): the CPU stream never won
+# at frame level. Assembling on its own is a wash below ~30 shapes (within
+# 1 ms, CPU faster in 52-58% of pairs) and clearly worse from ~1000 shapes
+# (synth3000 25 ms slower, hawaii 772 vs 26 ms), while a whole frame was
+# slower with CPU assembly at almost every size (CPU faster in only 0-30% of
+# pairs): the pools are consumed by GPU kernels, so building them on the CPU
+# stream adds a cross-stream dependency instead of queueing ahead of the
+# render kernels. Hence 0 (the GPU stream everywhere) until a measurement on
+# an idle machine says otherwise - these runs shared the machine at load
+# ~200, which penalises the CPU stream specifically. Re-derive with
+# scratchpad/lazycpu/measure_paired.py and set this to the crossover work.
+SCENE_BUILD_CPU_MAX_WORK = 0
+# The per-path sequential sums need a (paths, max segments) matrix; skip the
+# CPU stream when that matrix would be large in absolute terms (a scene mixing
+# one huge path with many small ones), not merely larger than the segment count.
+SCENE_BUILD_CPU_MAX_PADDED = 1 << 20
+
+
+def set_scene_build_device(device):
+    """
+        Where the flat pools are assembled on the GPU backend: 'auto'
+        (default: the CPU stream for small scenes, the GPU stream for large
+        ones), 'cpu' or 'gpu'. Both give the same pools; the rasterisation
+        kernels always run on the GPU.
+    """
+    global _scene_build_device
+    if device not in ('auto', 'cpu', 'gpu'):
+        raise ValueError("set_scene_build_device: expected 'auto', 'cpu' or 'gpu', got %r" % (device,))
+    _scene_build_device = device
+
+
+def get_scene_build_device():
+    return _scene_build_device
+
+
+def scene_build_work(topology):
+    """ Cheap structural size measure of the assembly (host ints, no sync). """
+    t = topology
+    return t.num_points + t.num_segments + t.num_shapes + t.num_groups + t.num_total_shapes
+
+
+def _use_cpu_build(t):
+    mode = _scene_build_device
+    if mode == 'gpu':
+        return False
+    if mode == 'cpu':
+        return True
+    if SCENE_BUILD_CPU_MAX_WORK <= 0 or scene_build_work(t) > SCENE_BUILD_CPU_MAX_WORK:
+        return False
+    return t.num_paths * t.max_segments_per_path <= SCENE_BUILD_CPU_MAX_PADDED
+
+
+def _cpu_tables(t):
+    """ Index tables of the CPU-stream path (built once per topology, host numpy). """
+    c = getattr(t, '_cpu_tab', None)
+    if c is not None:
+        return c
+    L = t.lay
+    npts, nbp, thick, ctrl = L['npts'], L['nbp'], L['thick'], L['ctrl']
+    P, Nseg = t.num_paths, t.num_segments
+    point_base = np.cumsum(npts) - npts
+    seg_start = np.cumsum(nbp) - nbp
+    path_of_seg = np.repeat(np.arange(P), nbp)
+    j_of_seg = np.arange(Nseg) - seg_start[path_of_seg]
+    c1 = ctrl + 1
+    cs = np.cumsum(c1) - c1
+    pid = cs - cs[seg_start[path_of_seg]] if Nseg else cs
+    base_seg = point_base[path_of_seg]
+    npts_seg = np.maximum(npts[path_of_seg], 1)
+    deg = ctrl
+    qs = np.arange(4)[None, :]
+    cc = deg[:, None]
+    idx = np.where(qs >= cc + 1,
+                   (base_seg + (pid + deg + 1) % npts_seg)[:, None],
+                   base_seg[:, None] + pid[:, None] + np.minimum(qs, cc))
+    th_start = np.cumsum(np.where(thick, npts, 0)) - np.where(thick, npts, 0)
+    thick_seg = thick[path_of_seg] if Nseg else np.zeros(0, bool)
+    tidx = np.where(thick_seg[:, None], th_start[path_of_seg][:, None] + (idx - base_seg[:, None]),
+                    t.num_thickness)
+    maxnbp = t.max_segments_per_path
+    pad = np.full((P, maxnbp), Nseg, np.int64)
+    if Nseg:
+        pad[path_of_seg, j_of_seg] = np.arange(Nseg)
+    c = dict(idx_m = mx.array(idx.reshape(-1).astype(np.int32)),
+             tidx_m = mx.array(tidx.reshape(-1).astype(np.int32)),
+             thick_seg_m = mx.array(thick_seg),
+             deg_m = mx.array(deg.astype(np.int32)),
+             path_of_seg_m = mx.array(path_of_seg.astype(np.int32)),
+             pad_m = mx.array(pad.reshape(-1).astype(np.int32)),
+             flat_m = mx.array((path_of_seg * maxnbp + j_of_seg).astype(np.int32)) if Nseg else None,
+             jmat = mx.array((np.tile(np.arange(maxnbp), (P, 1)) + 1).astype(np.float32)) if P and maxnbp else None,
+             nbp_col = mx.array(nbp.astype(np.float32).reshape(P, 1)) if P else None,
+             path_of_point_m = mx.array(np.repeat(np.arange(P), npts).astype(np.int32)),
+             maxnbp = maxnbp)
+    t._cpu_tab = c
+    return c
+
+
+def _f64(a):
+    return a.astype(mx.float64)
+
+
+def _fma_cpu(a, b, c):
+    """ float32 fma(a, b, c) (one rounding), a or b may be a Python float. """
+    x = _f64(a) if isinstance(a, mx.array) else a
+    y = _f64(b) if isinstance(b, mx.array) else b
+    return (x * y + _f64(c)).astype(mx.float32)
+
+
+def _fms_cpu(x, y, z, w):
+    """ fma(x, y, -(z * w)) as the C++ / kernel code contracts it (z * w rounded to float32). """
+    return _fma_cpu(x, y, -(z * w))
+
+
+def _dist_cpu(a, b):
+    d = a - b
+    return mx.sqrt(d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1])
+
+
+def _paths_cpu(t, pts, th, sw_path):
+    """ MLX-op equivalent of the 'paths' kernel (see its source above). """
+    c = _cpu_tables(t)
+    P, Nseg = t.num_paths, t.num_segments
+    pts2 = pts.reshape(-1, 2)
+    p4 = pts2[c['idx_m']].reshape(Nseg, 4, 2)
+    x, y = p4[:, :, 0], p4[:, :, 1]
+    seg_box = mx.stack([x.min(axis = 1), y.min(axis = 1), x.max(axis = 1), y.max(axis = 1)], axis = 1)
+    sw_seg = sw_path[c['path_of_seg_m']]
+    if t.num_thickness:
+        th4 = mx.concatenate([th, mx.zeros((1,), mx.float32)])[c['tidx_m']].reshape(Nseg, 4)
+        seg_r = mx.where(c['thick_seg_m'], th4.max(axis = 1), sw_seg)
+    else:
+        seg_r = sw_seg
+    P0, P1, P2, P3 = p4[:, 0], p4[:, 1], p4[:, 2], p4[:, 3]
+    t1 = np.float32(1.0) / np.float32(3.0)
+    t2 = np.float32(2.0) / np.float32(3.0)
+    def coef(tv):
+        tt = np.float32(1.0) - tv
+        return [float(tt * tt * tt), float(np.float32(3.0) * tt * tt * tv),
+                float(np.float32(3.0) * tt * tv * tv), float(tv * tv * tv)]
+    c1_, c2_ = coef(t1), coef(t2)
+    def ev(cf):
+        return ((cf[0] * P0 + cf[1] * P1) + cf[2] * P2) + cf[3] * P3
+    q = (0.25 * P0 + 0.5 * P1) + 0.25 * P2
+    d_line = _dist_cpu(P1, P0)
+    d_quad = _dist_cpu(q, P0) + _dist_cpu(q, P2)
+    v1, v2 = ev(c1_), ev(c2_)
+    d_cub = (_dist_cpu(v1, P0) + _dist_cpu(v1, v2)) + _dist_cpu(v2, P3)
+    deg = c['deg_m']
+    d = mx.where(deg == 0, d_line, mx.where(deg == 1, d_quad, d_cub))
+    # per-path sequential float32 sums over a zero-padded (P, max segments) matrix
+    maxnbp = c['maxnbp']
+    dpad = mx.concatenate([d, mx.zeros((1,), mx.float32)])[c['pad_m']].reshape(P, maxnbp)
+    cum = mx.cumsum(dpad, axis = 1)
+    path_len = mx.array(0.0, mx.float32) + cum[:, maxnbp - 1]
+    inv = (mx.array(1.0, mx.float32) / path_len).reshape(P, 1)
+    pmf_pad = dpad * inv
+    cdf_pad = mx.cumsum(pmf_pad, axis = 1)
+    positive = (path_len > mx.array(0.0, mx.float32)).reshape(P, 1)
+    uni = mx.array(1.0, mx.float32) / c['nbp_col']
+    pmf_pad = mx.where(positive, pmf_pad, uni)
+    cdf_pad = mx.where(positive, cdf_pad, c['jmat'] / c['nbp_col'])
+    seg_pmf = pmf_pad.reshape(-1)[c['flat_m']]
+    seg_cdf = cdf_pad.reshape(-1)[c['flat_m']]
+    inf = float(np.float32(np.inf))
+    pmin = mx.full((P, 2), inf, mx.float32).at[c['path_of_point_m']].minimum(pts2)
+    pmax = mx.full((P, 2), -inf, mx.float32).at[c['path_of_point_m']].maximum(pts2)
+    path_box = mx.concatenate([pmin, pmax], axis = 1)
+    return path_len, path_box, seg_pmf, seg_cdf, seg_box, seg_r
+
+
+def _ellipse_cpu(rx, ry):
+    """ MLX-op equivalent of the 'ellipse' kernel. """
+    s = mx.sqrt(_fma_cpu(3.0, rx, ry) * _fma_cpu(3.0, ry, rx))
+    pi = float(np.float32(np.pi))
+    return mx.array(0.0, mx.float32) + pi * _fma_cpu(3.0, rx + ry, -s)
+
+
+def _inverse_cpu(s2c, G):
+    """ MLX-op equivalent of the 'inverse' kernel (matrix.h inverse with clang's contraction). """
+    m = s2c.reshape(G, 9)
+    m00, m01, m02, m10, m11, m12, m20, m21, m22 = [m[:, k] for k in range(9)]
+    a = _fms_cpu(m11, m22, m21, m12)
+    b = _fms_cpu(m10, m22, m12, m20)
+    c = _fms_cpu(m10, m21, m11, m20)
+    det = _fma_cpu(m02, c, _fma_cpu(m00, a, -(m01 * b)))
+    invdet = mx.array(1.0, mx.float32) / det
+    cols = [a, _fms_cpu(m02, m21, m01, m22), _fms_cpu(m01, m12, m02, m11),
+            _fms_cpu(m12, m20, m10, m22), _fms_cpu(m00, m22, m02, m20), _fms_cpu(m10, m02, m00, m12),
+            _fms_cpu(m10, m21, m20, m11), _fms_cpu(m20, m01, m00, m21), _fms_cpu(m00, m11, m10, m01)]
+    return mx.stack([col * invdet for col in cols], axis = 1).reshape(-1)
+
+
+def _xform_box_cpu(s2c, box, n):
+    """ MLX-op equivalent of the 'xform_box' kernel (aabb.h transform). """
+    m = s2c.reshape(n, 9)
+    b = box.reshape(n, 4)
+    x0, y0, x1, y1 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    cx = [x0, x0, x1, x1]
+    cy = [y0, y1, y0, y1]
+    xs, ys = [], []
+    for k in range(4):
+        def xf(i, j, o):
+            return _fma_cpu(m[:, i], cx[k], m[:, j] * cy[k]) + m[:, o]
+        t0, t1, t2 = xf(0, 1, 2), xf(3, 4, 5), xf(6, 7, 8)
+        xs.append(t0 / t2)
+        ys.append(t1 / t2)
+    sx, sy = mx.stack(xs, axis = 1), mx.stack(ys, axis = 1)
+    return mx.stack([sx.min(axis = 1), sy.min(axis = 1), sx.max(axis = 1), sy.max(axis = 1)],
+                    axis = 1).reshape(-1)
+
+
+# ---------------------------------------------------------------------------
 # Topology
 
 class SceneTopology:
@@ -719,7 +965,8 @@ def _build_core(st):
     t.lay = dict(f_off = f_off, points_off = points_off, th_off = th_off, fill_off = fill_off,
                  stroke_off = stroke_off, gf_off = gf_off, fsz = fsz, ssz = ssz, stype = stype,
                  p_shape = p_shape, npts = npts, nbp = nbp, thick = thick, circ = circ, er = er,
-                 ftype = ftype, fn = fn, sctype = sctype, sn = sn)
+                 ftype = ftype, fn = fn, sctype = sctype, sn = sn, ctrl = ctrl)
+    t.max_segments_per_path = int(nbp.max()) if P else 0
 
     # ---- int pool layout
     I0 = 12 * S + 12 * G
@@ -1132,7 +1379,20 @@ def build_pools_from_sources(topology, sources, width, height, nsx, nsy, seed, u
         refit_from: a previous result for the same topology: the BVH leaf
         order and topology are reused (refit_bvhs) instead of rebuilding. The
         traversal stays valid but may differ from the CPU.
+        Everything stays lazy. The assembly runs on the CPU or the GPU stream
+        (set_scene_build_device); both give bit-identical pools.
     """
+    use_cpu = _use_cpu_build(topology)
+    if use_cpu:
+        with mx.stream(mx.cpu):
+            return _pools_impl(topology, sources, width, height, nsx, nsy, seed, use_prefiltering,
+                               eval_count, has_background, refit_from, True)
+    return _pools_impl(topology, sources, width, height, nsx, nsy, seed, use_prefiltering,
+                       eval_count, has_background, refit_from, False)
+
+
+def _pools_impl(topology, sources, width, height, nsx, nsy, seed, use_prefiltering, eval_count,
+                has_background, refit_from, use_cpu):
     t = topology
     S, G, T, P = t.num_shapes, t.num_groups, t.num_total_shapes, t.num_paths
     ip = _fill_call_slots(t.ip, width, height, nsx, nsy, seed, use_prefiltering, eval_count,
@@ -1156,14 +1416,17 @@ def build_pools_from_sources(topology, sources, width, height, nsx, nsy, seed, u
     nc, ne, nr = t.counts
     if P > 0:
         sw_path = sw[t.path_shape_m]
-        seg_f, path_f = _run('paths', [t.pinfo_m, t.ctrl_m, pts, th, sw_path], P,
-                             [7 * t.num_segments, 5 * P], [mx.float32, mx.float32])
-        seg_f = seg_f.reshape(-1, 7)
-        path_f = path_f.reshape(P, 5)
-        path_len = path_f[:, 0]
-        path_box = path_f[:, 1:5]
-        seg_pmf, seg_cdf = seg_f[:, 0], seg_f[:, 1]
-        seg_box, seg_r = seg_f[:, 2:6], seg_f[:, 6]
+        if use_cpu:
+            path_len, path_box, seg_pmf, seg_cdf, seg_box, seg_r = _paths_cpu(t, pts, th, sw_path)
+        else:
+            seg_f, path_f = _run('paths', [t.pinfo_m, t.ctrl_m, pts, th, sw_path], P,
+                                 [7 * t.num_segments, 5 * P], [mx.float32, mx.float32])
+            seg_f = seg_f.reshape(-1, 7)
+            path_f = path_f.reshape(P, 5)
+            path_len = path_f[:, 0]
+            path_box = path_f[:, 1:5]
+            seg_pmf, seg_cdf = seg_f[:, 0], seg_f[:, 1]
+            seg_box, seg_r = seg_f[:, 2:6], seg_f[:, 6]
     else:
         path_len = mx.zeros((0,), mx.float32)
         path_box = mx.zeros((0, 4), mx.float32)
@@ -1182,7 +1445,8 @@ def build_pools_from_sources(topology, sources, width, height, nsx, nsy, seed, u
     if ne:
         c = spm[t.ellipse_sid_m]
         rx, ry, cx, cy = c[:, 0], c[:, 1], c[:, 2], c[:, 3]
-        lens.append(_run('ellipse', [mx.stack([rx, ry], axis = 1)], ne, [ne], [mx.float32])[0])
+        lens.append(_ellipse_cpu(rx, ry) if use_cpu else
+                    _run('ellipse', [mx.stack([rx, ry], axis = 1)], ne, [ne], [mx.float32])[0])
         boxes.append(mx.stack([cx - rx, cy - ry, cx + rx, cy + ry], axis = 1))
     if nr:
         c = spm[t.rect_sid_m]
@@ -1198,7 +1462,8 @@ def build_pools_from_sources(topology, sources, width, height, nsx, nsy, seed, u
     # sample tables
     if T > 0:
         L = shape_len[t.sample_sid_m]
-        raw = _run('cumsum', [L, mx.array(np.array([T] + [0] * 7, np.int32))], 1, [T], [mx.float32])[0]
+        raw = mx.cumsum(L) if use_cpu else \
+            _run('cumsum', [L, mx.array(np.array([T] + [0] * 7, np.int32))], 1, [T], [mx.float32])[0]
         norm = raw[T - 1]
         nz = norm != 0
         scdf = mx.where(nz, raw / norm, zero)
@@ -1208,7 +1473,12 @@ def build_pools_from_sources(topology, sources, width, height, nsx, nsy, seed, u
         scdf = spmf = mx.zeros((0,), mx.float32)
         out['total_length'] = mx.array(0.0)
 
-    c2s = _run('inverse', [s2c], G, [9 * G], [mx.float32])[0] if G > 0 else mx.zeros((0,), mx.float32)
+    if G == 0:
+        c2s = mx.zeros((0,), mx.float32)
+    elif use_cpu:
+        c2s = _inverse_cpu(s2c, G)
+    else:
+        c2s = _run('inverse', [s2c], G, [9 * G], [mx.float32])[0]
 
     # BVHs
     prev = refit_from['bvh'] if refit_from is not None else None
@@ -1243,7 +1513,8 @@ def build_pools_from_sources(topology, sources, width, height, nsx, nsy, seed, u
             groots = mx.array(group_build.root.astype(np.int32))
             groot_f = group_build.nodes_f[groots]
             s2c_ne = s2c if E == 0 else s2c.reshape(G, 9)[t.nonempty_groups_m]
-            sbox = _run('xform_box', [s2c_ne, groot_f[:, :4]], NGE, [4 * NGE], [mx.float32])[0].reshape(NGE, 4)
+            sbox = (_xform_box_cpu(s2c_ne, groot_f[:, :4], NGE) if use_cpu else
+                    _run('xform_box', [s2c_ne, groot_f[:, :4]], NGE, [4 * NGE], [mx.float32])[0]).reshape(NGE, 4)
             sr = groot_f[:, 4]
             gnf, gni = group_build.nodes_f, group_build.nodes_i
         else:
