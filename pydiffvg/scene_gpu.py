@@ -1,5 +1,5 @@
 """
-    GPU scene construction for the Metal backend.
+    GPU scene construction, on either GPU backend (Metal or CUDA).
 
     Builds the flat scene pools of pydiffvg/metal/common.metal (identical
     layout to diffvg.Scene.export_flat()) directly from the serialized scene
@@ -15,21 +15,30 @@
     - build_pools(topology, args, ...) -> dict with ip / ints / floats: float
       parameters are copied with one bytes join per category (unified memory),
       then path lengths and CDFs, sample CDFs, canvas_to_shape inverses, shape
-      and segment bounding boxes are computed on the GPU (small Metal kernels
+      and segment bounding boxes are computed on the GPU (five small kernels
       and MLX ops) and all BVHs are built on the GPU (scene_gpu_bvh).
 
-    Bit parity with the C++ core: the kernels run in "safe" math mode and use
-    explicit fma() exactly where clang contracts a*b+c in the C++ sources
-    (-ffp-contract=on on arm64: matrix.h inverse and xform_pt, the Ramanujan
-    ellipse circumference), and the running sums (path length, path CDF,
-    sample CDF) are sequential float32 loops in C++ order.
+    The five kernels have one body each, written in the backend-neutral
+    dialect of gpu_backend.py and compiled for whichever backend is active;
+    their helper functions live in pydiffvg/metal/scene.metal and
+    pydiffvg/cuda/scene.cu. scene_gpu_bvh is MLX ops only, so it is
+    backend-independent already.
+
+    Bit parity with the C++ core: the kernels avoid contraction (Metal: safe
+    math and `#pragma METAL fp contract(off)'; CUDA: the __fmul_rn / __fadd_rn
+    intrinsics, since nvrtc offers no such pragma) and use explicit fma()
+    exactly where clang contracts a*b+c in the C++ sources (-ffp-contract=on:
+    matrix.h inverse and xform_pt, the Ramanujan ellipse circumference), and
+    the running sums (path length, path CDF, sample CDF) are sequential
+    float32 loops in C++ order. sqrt is correctly rounded on both backends
+    (Metal needs the correction in sg_sqrt, CUDA's sqrtf already is).
 
     Everything is lazy: no call in the per-frame path evaluates an array, so
     the pools are one MLX graph that the rasterisation kernels consume.
     The pools can be assembled on either stream: set_scene_build_device('auto'
     | 'cpu' | 'gpu'), where 'auto' decides from a structural size measure
-    (scene_build_work) without any sync. The five helper metal_kernels only
-    run on the GPU, so the CPU stream uses MLX-op equivalents that produce
+    (scene_build_work) without any sync. The five helper kernels only run on
+    the GPU, so the CPU stream uses MLX-op equivalents that produce
     bit-identical pools (see below). 'auto' currently keeps every scene on the
     GPU stream: measured, the CPU stream never made a frame faster, because
     the pools feed GPU kernels and building them on the other stream
@@ -43,11 +52,13 @@ import numpy as np
 import mlx.core as mx
 import diffvg
 
+from . import gpu_backend as gb
 from . import scene_gpu_bvh as sgb
 
 __all__ = ['SceneTopology', 'topology_from_args', 'topology_signature', 'build_pools',
            'build_pools_from_sources', 'sources_from_args', 'grad_index_map', 'clear_topology_cache',
-           'set_scene_build_device', 'get_scene_build_device', 'scene_build_work']
+           'set_scene_build_device', 'get_scene_build_device', 'scene_build_work',
+           'supports_backend']
 
 # ip slots (pydiffvg/metal/common.metal)
 IP_W, IP_H, IP_NSX, IP_NSY = 0, 1, 2, 3
@@ -162,61 +173,31 @@ def _seed_bits(seed):
 
 
 # ---------------------------------------------------------------------------
-# Metal kernels (safe math: no contraction / reassociation, explicit fma)
-
-_HEADER = """
-// Metal's clang contracts a*b + c within one expression even in safe math
-// mode (measured); the C++ contractions are reproduced with explicit fma() only.
-#pragma METAL fp contract(off)
-// Correctly rounded sqrt for finite x >= 0, as the CPU's fsqrt. Metal's sqrt
-// is not (measured: 30% of random inputs off by 1 ulp, sqrt(3136) = 56.000004).
-// The approximate root s = M * 2^(e-24) (M a 24-bit integer) is corrected with
-// exact 64-bit integer tests (2M - 1)^2 < 4x/u^2 < (2M + 1)^2, u = 2^(e-24);
-// 4x/u^2 is an exact integer and midpoints cannot occur.
-inline float sg_sqrt(float x) {
-    float s = sqrt(x);
-    if (!(x >= 1.2e-38f) || !(x <= 3.4028235e38f)) {
-        return s;  // 0, subnormals, inf/NaN (not produced by finite scenes)
-    }
-    for (int it = 0; it < 2; it++) {
-        int e = 0;
-        float f = frexp(s, e);
-        long M = long(ldexp(f, 24));
-        ulong X = ulong(ldexp(x, 2 - 2 * (e - 24)));
-        long lo = 2 * M - 1;
-        long hi = 2 * M + 1;
-        while (ulong(hi) * ulong(hi) <= X) { M++; hi += 2; lo += 2; }
-        while (lo > 0 && ulong(lo) * ulong(lo) >= X) { M--; hi -= 2; lo -= 2; }
-        s = ldexp(float(M), e - 24);
-    }
-    return s;
-}
-inline float sg_dist(float2 a, float2 b) {
-    float dx = a.x - b.x;
-    float dy = a.y - b.y;
-    // vector.h length_squared = square(x) + square(y): function calls, so
-    // clang does not contract it
-    return sg_sqrt(dx * dx + dy * dy);
-}
-// matrix.h xform_pt with clang's contraction: m(0,0)*x + m(0,1)*y + m(0,2)
-inline float sg_xf(float a, float x, float b, float y, float c) {
-    return fma(a, x, b * y) + c;
-}
-"""
+# GPU kernels (safe math: no contraction / reassociation, explicit fma)
+#
+# Each body is written once, in the backend-neutral dialect of gpu_backend.py:
+# `DVG_THREAD_INDEX;` declares `idx` (on CUDA together with the mandatory
+# bounds check). The helpers the bodies call -- sg_sqrt, sg_dist, sg_xf,
+# sg_fma, sg_mul, sg_add, sg_inf and the 2-vector sg_f2 -- are defined once per
+# backend in pydiffvg/metal/scene.metal and pydiffvg/cuda/scene.cu with
+# identical rounding; read those files for why the arithmetic is spelled the
+# way it is (contraction off / __fmul_rn, corrected sqrt / plain sqrtf).
+_HEADER_FILES = ('scene',)
 
 # Per path (thread): shapes_bbox, compute_shape_length, build_path_cdfs and the
 # path BVH leaf boxes / radii of compute_bounding_boxes, in C++ order.
 #   pinfo[5p..]: first point, first segment, num_base_points, num_points, first thickness (-1)
 #   seg_f[7e..]: pmf, cdf, box(4), radius; path_f[5p..]: length, bbox(4)
 _PATHS_SOURCE = """
-    uint p = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
+    int p = (int) idx;
     int po = pinfo[5 * p];
     int so = pinfo[5 * p + 1];
     int nb = pinfo[5 * p + 2];
     int npt = pinfo[5 * p + 3];
     int to = pinfo[5 * p + 4];
     float r = sw[p];
-    float inf = numeric_limits<float>::infinity();
+    float inf = sg_inf();
     float b0x = inf, b0y = inf, b1x = -inf, b1y = -inf;
     if (npt > 0) {
         b0x = pts[2 * po]; b0y = pts[2 * po + 1];
@@ -246,9 +227,9 @@ _PATHS_SOURCE = """
         }
         ids[c + 1] = (pid + c + 1) % npt;
         pid += c + 1;
-        float2 P[4];
+        sg_f2 P[4];
         for (int q = 0; q <= c + 1; q++) {
-            P[q] = float2(pts[2 * (po + ids[q])], pts[2 * (po + ids[q]) + 1]);
+            P[q] = sg_f2(pts[2 * (po + ids[q])], pts[2 * (po + ids[q]) + 1]);
         }
         float x0 = inf, y0 = inf, x1 = -inf, y1 = -inf;
         for (int q = 0; q <= c + 1; q++) {
@@ -269,13 +250,13 @@ _PATHS_SOURCE = """
         if (c == 0) {
             d = sg_dist(P[1], P[0]);
         } else if (c == 1) {
-            float2 v1 = float2(0.25f * P[0].x, 0.25f * P[0].y) + float2(0.5f * P[1].x, 0.5f * P[1].y);
-            v1 = v1 + float2(0.25f * P[2].x, 0.25f * P[2].y);
+            sg_f2 v1 = sg_f2(0.25f * P[0].x, 0.25f * P[0].y) + sg_f2(0.5f * P[1].x, 0.5f * P[1].y);
+            v1 = v1 + sg_f2(0.25f * P[2].x, 0.25f * P[2].y);
             d = sg_dist(v1, P[0]) + sg_dist(v1, P[2]);
         } else {
-            float2 v1 = (c10 * P[0] + c11 * P[1]) + c12 * P[2];
+            sg_f2 v1 = (c10 * P[0] + c11 * P[1]) + c12 * P[2];
             v1 = v1 + c13 * P[3];
-            float2 v2 = (c20 * P[0] + c21 * P[1]) + c22 * P[2];
+            sg_f2 v2 = (c20 * P[0] + c21 * P[1]) + c22 * P[2];
             v2 = v2 + c23 * P[3];
             d = (sg_dist(v1, P[0]) + sg_dist(v1, v2)) + sg_dist(v2, P[3]);
         }
@@ -299,7 +280,7 @@ _PATHS_SOURCE = """
         float cdf = 0.0f;
         for (int j = 0; j < nb; j++) {
             int e = 7 * (so + j);
-            float d = seg_f[e] * inv_length;
+            float d = sg_mul(seg_f[e], inv_length);
             seg_f[e] = d;
             cdf = j == 0 ? d : d + cdf;
             seg_f[e + 1] = cdf;
@@ -315,6 +296,8 @@ _PATHS_SOURCE = """
 
 # Sequential float32 running sum (build_shape_cdfs), one thread.
 _CUMSUM_SOURCE = """
+    DVG_THREAD_INDEX;
+    (void) idx;
     int n = count[0];
     float c = 0.0f;
     for (int s = 0; s < n; s++) {
@@ -325,33 +308,35 @@ _CUMSUM_SOURCE = """
 
 # matrix.h inverse (3x3) with clang's contraction (verified bit-exact).
 _INVERSE_SOURCE = """
-    uint g = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
+    int g = (int) idx;
     int o = 9 * g;
     float m00 = m[o], m01 = m[o + 1], m02 = m[o + 2];
     float m10 = m[o + 3], m11 = m[o + 4], m12 = m[o + 5];
     float m20 = m[o + 6], m21 = m[o + 7], m22 = m[o + 8];
-    float a = fma(m11, m22, -(m21 * m12));
-    float b = fma(m10, m22, -(m12 * m20));
-    float c = fma(m10, m21, -(m11 * m20));
-    float det = fma(m02, c, fma(m00, a, -(m01 * b)));
+    float a = sg_fma(m11, m22, -sg_mul(m21, m12));
+    float b = sg_fma(m10, m22, -sg_mul(m12, m20));
+    float c = sg_fma(m10, m21, -sg_mul(m11, m20));
+    float det = sg_fma(m02, c, sg_fma(m00, a, -sg_mul(m01, b)));
     float invdet = 1.0f / det;
     out[o] = a * invdet;
-    out[o + 1] = fma(m02, m21, -(m01 * m22)) * invdet;
-    out[o + 2] = fma(m01, m12, -(m02 * m11)) * invdet;
-    out[o + 3] = fma(m12, m20, -(m10 * m22)) * invdet;
-    out[o + 4] = fma(m00, m22, -(m02 * m20)) * invdet;
-    out[o + 5] = fma(m10, m02, -(m00 * m12)) * invdet;
-    out[o + 6] = fma(m10, m21, -(m20 * m11)) * invdet;
-    out[o + 7] = fma(m20, m01, -(m00 * m21)) * invdet;
-    out[o + 8] = fma(m00, m11, -(m10 * m01)) * invdet;
+    out[o + 1] = sg_fma(m02, m21, -sg_mul(m01, m22)) * invdet;
+    out[o + 2] = sg_fma(m01, m12, -sg_mul(m02, m11)) * invdet;
+    out[o + 3] = sg_fma(m12, m20, -sg_mul(m10, m22)) * invdet;
+    out[o + 4] = sg_fma(m00, m22, -sg_mul(m02, m20)) * invdet;
+    out[o + 5] = sg_fma(m10, m02, -sg_mul(m00, m12)) * invdet;
+    out[o + 6] = sg_fma(m10, m21, -sg_mul(m20, m11)) * invdet;
+    out[o + 7] = sg_fma(m20, m01, -sg_mul(m00, m21)) * invdet;
+    out[o + 8] = sg_fma(m00, m11, -sg_mul(m10, m01)) * invdet;
 """
 
 # aabb.h transform(shape_to_canvas, box): merge of the 4 transformed corners.
 _XFORM_BOX_SOURCE = """
-    uint g = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
+    int g = (int) idx;
     int o = 9 * g;
     int bo = 4 * g;
-    float inf = numeric_limits<float>::infinity();
+    float inf = sg_inf();
     float x0 = inf, y0 = inf, x1 = -inf, y1 = -inf;
     float cx[4] = {box[bo], box[bo], box[bo + 2], box[bo + 2]};
     float cy[4] = {box[bo + 1], box[bo + 3], box[bo + 1], box[bo + 3]};
@@ -374,12 +359,13 @@ _XFORM_BOX_SOURCE = """
 
 # Ramanujan ellipse circumference as clang compiles it (compute_shape_length).
 _ELLIPSE_SOURCE = """
-    uint i = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
+    int i = (int) idx;
     float a = r[2 * i];
     float b = r[2 * i + 1];
     float pi = 3.14159265358979323846f;
-    float s = sg_sqrt(fma(3.0f, a, b) * fma(3.0f, b, a));
-    out[i] = 0.0f + pi * fma(3.0f, a + b, -s);
+    float s = sg_sqrt(sg_fma(3.0f, a, b) * sg_fma(3.0f, b, a));
+    out[i] = 0.0f + pi * sg_fma(3.0f, a + b, -s);
 """
 
 _KERNEL_DEFS = {
@@ -389,46 +375,94 @@ _KERNEL_DEFS = {
     'xform_box': (['m', 'box'], ['out'], _XFORM_BOX_SOURCE),
     'ellipse': (['r'], ['out'], _ELLIPSE_SOURCE),
 }
-_kernels = {}
+_kernels = {}          # (backend, name) -> kernel
+
+
+class _SafeMetalKernel:
+    """
+        mx.fast.metal_kernel with the call signature of gpu_backend.Kernel.
+
+        The scene kernels cannot go through gpu_backend.kernel() on Metal:
+        that builds every Metal kernel with atomic_outputs (so an output buffer
+        can only be written through atomic_store, and the 'paths' kernel reads
+        its own output back) and with math_mode 'fast', which the rasterisation
+        kernels need but the pools must not have -- fast math replaces the
+        divisions with reciprocal approximations and breaks bit parity with the
+        C++ core. On CUDA neither option exists, nvrtc's defaults are the ones
+        wanted, and gpu_backend.kernel() is used unchanged; should it ever grow
+        math_mode / atomic_outputs arguments, this class and the Metal branch
+        of _kernel() disappear.
+    """
+    __slots__ = ('fn',)
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, inputs, grid, output_shapes, output_dtypes, init_value = None,
+                 threadgroup = None):
+        kwargs = {} if init_value is None else {'init_value': init_value}
+        return self.fn(inputs = inputs, grid = grid, threadgroup = threadgroup,
+                       output_shapes = output_shapes, output_dtypes = output_dtypes, **kwargs)
+
+
+def supports_backend(backend):
+    """
+        Whether this module can build the pools on a GPU backend (render_mlx
+        falls back to the C++ scene when it cannot). Both GPU backends are
+        supported; anything else (no GPU at all) is not.
+    """
+    return backend in gb.BACKENDS
 
 
 def _kernel(name):
-    k = _kernels.get(name)
+    backend = gb.require_backend()
+    key = (backend, name)
+    k = _kernels.get(key)
     if k is None:
         inputs, outputs, source = _KERNEL_DEFS[name]
-        k = _kernels[name] = mx.fast.metal_kernel(
-            name = 'diffvg_scene_gpu_' + name,
-            input_names = inputs,
-            output_names = outputs,
-            source = source,
-            header = _HEADER,
-            ensure_row_contiguous = True,
-            atomic_outputs = False,
-            compile_options = {'math_mode': 'safe'})
+        if backend == 'cuda':
+            k = gb.kernel('scene_gpu_' + name, inputs, outputs, source, _HEADER_FILES)
+        else:
+            k = _SafeMetalKernel(mx.fast.metal_kernel(
+                name = 'diffvg_scene_gpu_' + name,
+                input_names = list(inputs),
+                output_names = list(outputs),
+                source = gb.expand_source(source, backend),
+                header = gb.header(_HEADER_FILES, backend = backend),
+                ensure_row_contiguous = True,
+                atomic_outputs = False,
+                compile_options = {'math_mode': 'safe'}))
+        _kernels[key] = k
     return k
 
 
 def _run(name, inputs, grid, out_sizes, out_dtypes):
+    # `grid` is a thread count on both backends; CUDA rounds it up to whole
+    # blocks and the bounds check of DVG_THREAD_INDEX drops the extra threads.
+    n = max(grid, 1)
     outs = _kernel(name)(
         inputs = [_pad(a) for a in inputs],
-        grid = (max(grid, 1), 1, 1),
-        threadgroup = (min(64, max(grid, 1)), 1, 1),
-        output_shapes = [(max(n, _MIN_BUFFER),) for n in out_sizes],
+        grid = (n, 1, 1),
+        threadgroup = (min(64, n), 1, 1),
+        output_shapes = [(max(s, _MIN_BUFFER),) for s in out_sizes],
         output_dtypes = out_dtypes,
         init_value = 0)
-    return [o[:n] for o, n in zip(outs, out_sizes)]
+    return [o[:s] for o, s in zip(outs, out_sizes)]
 
 
 def reset_kernel_cache():
+    """ Forget the built kernels and the loaded sources (after editing them). """
     _kernels.clear()
+    gb.reset_kernel_cache()
 
 
 # ---------------------------------------------------------------------------
 # CPU-stream assembly
 #
-# mx.fast.metal_kernel only runs on the GPU ("[metal_kernel] Only supports the
+# A custom kernel only runs on the GPU ("[metal_kernel] Only supports the
 # GPU"), so the five helper kernels above have MLX-op equivalents used when the
-# pools are assembled on the CPU stream. They are bit-identical to the kernels:
+# pools are assembled on the CPU stream. They are backend-independent, and
+# bit-identical to the kernels:
 # - the C++ contractions that the kernels write as fma() are emulated in
 #   float64 (CPU-only dtype: one rounding, as fma), the inner products that C++
 #   rounds to float32 first are kept in float32;

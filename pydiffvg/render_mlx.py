@@ -615,14 +615,20 @@ def _record_pools(topology, pools, refit):
 def _scene_pools(args, width, height, num_samples_x, num_samples_y, seed, use_prefiltering,
                  eval_count, has_background):
     """
-        Flat scene pools for the Metal kernels. Returns a dict:
+        Flat scene pools for the GPU kernels. Returns a dict:
         ip (numpy, per-call slots filled), ints / floats (mx.array for the
         'gpu' builder, numpy for 'cpu'), grads (render_metal.GradGather),
         builder, and 'scene' (the C++ scene for 'cpu').
     """
     from . import render_metal
     from . import scene_gpu
-    if _gpu_scene_builder == 'gpu':
+    from . import gpu_backend
+    # scene_gpu builds the pools with GPU kernels of its own; fall back to the
+    # C++ scene on a backend it does not support yet.
+    supports = getattr(scene_gpu, 'supports_backend', None)
+    builder_ok = supports(gpu_backend.get_gpu_backend()) if supports is not None \
+        else gpu_backend.get_gpu_backend() == 'metal'
+    if _gpu_scene_builder == 'gpu' and builder_ok:
         mx.eval([a for a in args if isinstance(a, mx.array)])
         try:
             topology = scene_gpu.topology_from_args(args, trust_int_identity = _scene_topology_trust)

@@ -365,7 +365,9 @@ float cubic_distance_lower_bound(const Vector2f &p0, const Vector2f &p1,
     auto h = max(point_to_segment_distance(p1, p0, p3), point_to_segment_distance(p2, p0, p3));
     auto m = 0.f;
     for (const Vector2f &q : {p0 - pt, p1 - pt, p2 - pt, p3 - pt}) {
-        m = max(m, max(fabs(q.x), fabs(q.y)));
+        // explicit float: with <math.h> in scope fabs() returns double, and
+        // max(float, double) does not compile (clang accepts it, g++ does not)
+        m = max(m, max(float(fabs(q.x)), float(fabs(q.y))));
     }
     return point_to_segment_distance(pt, p0, p3) - h - 1e-5f * (1 + m);
 }
@@ -648,8 +650,10 @@ bool compute_distance(const SceneData &scene,
         auto a11 = c(0, 1) * c(0, 1) + c(1, 1) * c(1, 1);
         auto half_tr = (a00 + a11) / 2;
         auto det = a00 * a11 - a01 * a01;
-        auto lambda_max = half_tr + sqrt(max(half_tr * half_tr - det, 0.f));
-        local_max_radius = max_radius * sqrt(max(lambda_max, 0.f));
+        // explicit float: with <math.h> in scope sqrt() returns double, and
+        // max(double, float) does not compile (clang accepts it, g++ does not)
+        auto lambda_max = half_tr + float(sqrt(max(half_tr * half_tr - det, 0.f)));
+        local_max_radius = max_radius * float(sqrt(max(lambda_max, 0.f)));
     }
 
     while (stack_size > 0) {

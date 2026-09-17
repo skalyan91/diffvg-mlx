@@ -1,10 +1,16 @@
 """
-    Metal (Apple GPU) kernels for diffvg stage 3: signed distance output
-    (forward + backward, also at eval_positions), prefiltered colour
-    (forward + backward), and the screen-space translation gradient image.
+    GPU kernels for diffvg stage 3: signed distance output (forward +
+    backward, also at eval_positions), prefiltered colour (forward +
+    backward), and the screen-space translation gradient image.
 
-    Shared Metal code: pydiffvg/metal/{common, geometry, color, backward,
-    distance_grad, prefilter}.metal. The *_flat functions take pools from
+    Built through pydiffvg/gpu_backend.py for either Apple Metal or NVIDIA
+    CUDA; the kernel bodies below are written once in the backend-neutral
+    dialect documented there (DVG_THREAD_INDEX / DVG_ADD / DVG_STORE /
+    DVG_XYZ / DVG_CEIL).
+
+    Shared device code: pydiffvg/metal/{common, geometry, color, backward,
+    distance_grad, prefilter}.metal, mirrored by pydiffvg/cuda/*.cu.
+    The *_flat functions take pools from
     scene_gpu.build_pools / build_pools_from_sources (mx arrays; the latter
     is also used by the packed-parameter API, pydiffvg/packed.py) or
     export_flat (numpy), as in
@@ -25,35 +31,23 @@ import mlx.core as mx
 from . import render_mlx
 from . import render_metal as rm
 from . import metal_scene as ms
+from . import gpu_backend as gb
 
-_HEADER_FILES = ('common.metal', 'geometry.metal', 'color.metal', 'backward.metal',
-                 'distance_grad.metal', 'prefilter.metal')
+# Extension-free base names; gpu_backend picks metal/*.metal or cuda/*.cu.
+_HEADER_FILES = ('common', 'geometry', 'color', 'backward', 'distance_grad', 'prefilter')
 _MIN = rm._MIN_BUFFER
 
-# opts[] slots (prefilter.metal PF_OPT_*)
+# opts[] slots (prefilter source, PF_OPT_*)
 OPT_WANT_TRANSLATION = 0
 OPT_EXACT_SCAN = 1
 
-_header = None
-_kernels = {}
-
 
 def _load_header():
-    global _header
-    if _header is None:
-        parts = []
-        for name in _HEADER_FILES:
-            with open(os.path.join(rm._METAL_DIR, name), 'r') as f:
-                parts.append('// ---- %s ----\n' % name)
-                parts.append(f.read())
-        _header = '\n'.join(parts)
-    return _header
+    return gb.header(_HEADER_FILES)
 
 
 def reset_kernel_cache():
-    global _header
-    _header = None
-    _kernels.clear()
+    gb.reset_kernel_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +55,7 @@ def reset_kernel_cache():
 
 # Sample position (grid mode) or eval position; canvas-space point `cpt`.
 _POSITION = """
-    uint idx = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
     int width = ip[IP_W];
     int height = ip[IP_H];
@@ -90,7 +84,7 @@ _SDF_FORWARD_SOURCE = _POSITION + """
                 dist = -dist;
             }
             int o = use_eval ? int(idx) : y * width + x;
-            atomic_fetch_add_explicit(&sdf_image[o], dist, memory_order_relaxed);
+            DVG_ADD(sdf_image, o, dist);
         }
     }
 """
@@ -106,19 +100,19 @@ _SDF_BACKWARD_SOURCE = _POSITION + """
             float2 d_t = float2(0);
             d_compute_distance(s, r.group_id, r.shape_id, cpt, r.closest_pt, r.info, d_abs_dist, g, d_t);
             for (int k = 0; k < g.n; k++) {
-                atomic_fetch_add_explicit(&d_floats[g.idx[k]], g.val[k], memory_order_relaxed);
+                DVG_ADD(d_floats, g.idx[k], g.val[k]);
             }
             if (opts[PF_OPT_WANT_TRANSLATION] != 0 && x >= 0 && x < width && y >= 0 && y < height) {
                 int o = 2 * (y * width + x);
-                atomic_fetch_add_explicit(&d_translation[o], d_t.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(&d_translation[o + 1], d_t.y, memory_order_relaxed);
+                DVG_ADD(d_translation, o, d_t.x);
+                DVG_ADD(d_translation, o + 1, d_t.y);
             }
         }
     }
 """
 
 _PREFILTER_COMMON = """
-    uint idx = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
     int width = ip[IP_W];
     int height = ip[IP_H];
@@ -140,7 +134,7 @@ _PREFILTER_COMMON = """
     float4 color = pf_blend(fragments, num_fragments, has_bg, bg, accum_color, accum_alpha);
     int ftype = ip[IP_FILTER_TYPE];
     float radius = filter_radius(s);
-    int ri = int(ceil(radius));
+    int ri = int(DVG_CEIL(radius));
 """
 
 _PREFILTER_FORWARD_SOURCE = _PREFILTER_COMMON + """
@@ -154,10 +148,10 @@ _PREFILTER_FORWARD_SOURCE = _PREFILTER_COMMON + """
                     float fw = compute_filter_weight(ftype, radius, xx + 0.5f - pt.x, yy + 0.5f - pt.y);
                     float4 wc = fw * color / weight_sum;
                     int o = 4 * (yy * width + xx);
-                    atomic_fetch_add_explicit(&render_image[o], wc[0], memory_order_relaxed);
-                    atomic_fetch_add_explicit(&render_image[o + 1], wc[1], memory_order_relaxed);
-                    atomic_fetch_add_explicit(&render_image[o + 2], wc[2], memory_order_relaxed);
-                    atomic_fetch_add_explicit(&render_image[o + 3], wc[3], memory_order_relaxed);
+                    DVG_ADD(render_image, o, wc[0]);
+                    DVG_ADD(render_image, o + 1, wc[1]);
+                    DVG_ADD(render_image, o + 2, wc[2]);
+                    DVG_ADD(render_image, o + 3, wc[3]);
                 }
             }
         }
@@ -167,16 +161,16 @@ _PREFILTER_FORWARD_SOURCE = _PREFILTER_COMMON + """
 _PREFILTER_BACKWARD_SOURCE = _PREFILTER_COMMON + """
     float4 d_color = gather_d_color(s, d_render_image, weight_image, pt);
     float2 d_t = float2(0);
-    float3 d_curr_color = d_color.xyz;
+    float3 d_curr_color = DVG_XYZ(d_color);
     float d_curr_alpha = d_color.w;
     if (num_fragments > 0) {
         float final_alpha = color.w;
         if (final_alpha > 1e-6f) {
-            d_curr_color = d_color.xyz / final_alpha;
-            d_curr_alpha -= dot(d_color.xyz, color.xyz) / final_alpha;
+            d_curr_color = DVG_XYZ(d_color) / final_alpha;
+            d_curr_alpha -= dot(DVG_XYZ(d_color), DVG_XYZ(color)) / final_alpha;
         }
         float first_alpha = has_bg ? bg.w : 0.f;
-        float3 first_color = has_bg ? bg.xyz : float3(0);
+        float3 first_color = has_bg ? DVG_XYZ(bg) : float3(0);
         GradWrites g;
         for (int i = num_fragments - 1; i >= 0; i--) {
             float prev_alpha = i > 0 ? accum_alpha[i - 1] : first_alpha;
@@ -190,7 +184,7 @@ _PREFILTER_BACKWARD_SOURCE = _PREFILTER_COMMON + """
             gw_clear(g);
             pf_d_fragment(s, fragments[i], cpt, d_color_i, d_alpha_i, g, d_t);
             for (int k = 0; k < g.n; k++) {
-                atomic_fetch_add_explicit(&d_floats[g.idx[k]], g.val[k], memory_order_relaxed);
+                DVG_ADD(d_floats, g.idx[k], g.val[k]);
             }
             d_curr_color = d_prev_color;
             d_curr_alpha = d_prev_alpha;
@@ -198,15 +192,15 @@ _PREFILTER_BACKWARD_SOURCE = _PREFILTER_COMMON + """
     }
     if (has_bg) {
         int b = 4 * (y * width + x);
-        atomic_fetch_add_explicit(&d_background[b], d_curr_color.x, memory_order_relaxed);
-        atomic_fetch_add_explicit(&d_background[b + 1], d_curr_color.y, memory_order_relaxed);
-        atomic_fetch_add_explicit(&d_background[b + 2], d_curr_color.z, memory_order_relaxed);
-        atomic_fetch_add_explicit(&d_background[b + 3], d_curr_alpha, memory_order_relaxed);
+        DVG_ADD(d_background, b, d_curr_color.x);
+        DVG_ADD(d_background, b + 1, d_curr_color.y);
+        DVG_ADD(d_background, b + 2, d_curr_color.z);
+        DVG_ADD(d_background, b + 3, d_curr_alpha);
     }
     if (opts[PF_OPT_WANT_TRANSLATION] != 0) {
         int o = 2 * (y * width + x);
-        atomic_fetch_add_explicit(&d_translation[o], d_t.x, memory_order_relaxed);
-        atomic_fetch_add_explicit(&d_translation[o + 1], d_t.y, memory_order_relaxed);
+        DVG_ADD(d_translation, o, d_t.x);
+        DVG_ADD(d_translation, o + 1, d_t.y);
     }
     // Backprop to the filter weights; the weight fw of this sample is unused here
     float d_radius = 0;
@@ -233,7 +227,7 @@ _PREFILTER_BACKWARD_SOURCE = _PREFILTER_COMMON + """
             }
         }
     }
-    atomic_fetch_add_explicit(&d_floats[ip[IP_FILTER_RADIUS_OFF]], d_radius, memory_order_relaxed);
+    DVG_ADD(d_floats, ip[IP_FILTER_RADIUS_OFF], d_radius);
 """
 
 _KERNEL_DEFS = {
@@ -249,20 +243,9 @@ _KERNEL_DEFS = {
 
 
 def _kernel(name):
-    k = _kernels.get(name)
-    if k is None:
-        inputs, outputs, source = _KERNEL_DEFS[name]
-        k = mx.fast.metal_kernel(
-            name = 'diffvg_' + name,
-            input_names = inputs,
-            output_names = outputs,
-            source = source,
-            header = _load_header(),
-            ensure_row_contiguous = True,
-            atomic_outputs = True,
-            compile_options = {'math_mode': 'fast'})
-        _kernels[name] = k
-    return k
+    """ The kernel for the active GPU backend (built once, cached there). """
+    inputs, outputs, source = _KERNEL_DEFS[name]
+    return gb.kernel(name, inputs, outputs, source, _HEADER_FILES)
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +303,7 @@ def sdf_forward_flat(ip, ints, floats, width, height, nsx, nsy, seed, eval_posit
         return mx.zeros((out_n, 1) if n_eval > 0 else (height, width, 1), dtype = mx.float32)
     out = _kernel('sdf_forward')(
         inputs = [ip_m, ints_m, floats_m, ev, _opts()],
-        grid = (n, 1, 1), threadgroup = rm._threadgroup(n),
+        grid = (n, 1, 1),
         output_shapes = [(max(out_n, _MIN),)], output_dtypes = [mx.float32],
         init_value = 0)[0]
     out = out[:out_n]
@@ -341,7 +324,7 @@ def sdf_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed, d_sdf,
     nt = max(2 * width * height, _MIN) if want_translation else _MIN
     d_floats, d_trans = _kernel('sdf_backward')(
         inputs = [ip_m, ints_m, floats_m, ev, _opts(want_translation), d_sdf_m],
-        grid = (n, 1, 1), threadgroup = rm._threadgroup(n),
+        grid = (n, 1, 1),
         output_shapes = [(nf,), (nt,)], output_dtypes = [mx.float32, mx.float32],
         init_value = 0)
     return d_floats, (d_trans[:2 * width * height].reshape(height, width, 2) if want_translation else None)
@@ -361,7 +344,7 @@ def _weight_image(ip_m, ints_m, floats_m, n, width, height):
     # render_metal's weight kernel; sample_position honours IP_USE_PREFILTERING
     return rm._kernel('weight')(
         inputs = [ip_m, ints_m, floats_m],
-        grid = (n, 1, 1), threadgroup = rm._threadgroup(n),
+        grid = (n, 1, 1),
         output_shapes = [(max(width * height, _MIN),)], output_dtypes = [mx.float32],
         init_value = 0)[0]
 
@@ -392,7 +375,7 @@ def prefiltered_forward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
     out = _kernel('prefilter_forward')(
         inputs = [ip_m, ints_m, floats_m, weight, _background_m(background_image, width, height),
                   _opts(exact_scan = exact_scan)],
-        grid = (n, 1, 1), threadgroup = rm._threadgroup(n),
+        grid = (n, 1, 1),
         output_shapes = [(max(width * height * 4, _MIN),)], output_dtypes = [mx.float32],
         init_value = 0)[0]
     return out[:width * height * 4].reshape(height, width, 4)
@@ -422,7 +405,7 @@ def prefiltered_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
         render_image = _kernel('prefilter_forward')(
             inputs = [ip_m, ints_m, floats_m, weight, _background_m(background_image, width, height),
                       _opts(exact_scan = exact_scan)],
-            grid = (n, 1, 1), threadgroup = rm._threadgroup(n),
+            grid = (n, 1, 1),
             output_shapes = [(max(npx * 4, _MIN),)], output_dtypes = [mx.float32],
             init_value = 0)[0]
     fwd_img = rm._pad(_as_mx(render_image))
@@ -431,7 +414,7 @@ def prefiltered_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
     d_floats, d_bg, d_trans = _kernel('prefilter_backward')(
         inputs = [ip_m, ints_m, floats_m, weight, _background_m(background_image, width, height),
                   _opts(want_translation, exact_scan), d_img, fwd_img],
-        grid = (n, 1, 1), threadgroup = rm._threadgroup(n),
+        grid = (n, 1, 1),
         output_shapes = [(nf,), (nb,), (nt,)], output_dtypes = [mx.float32] * 3,
         init_value = 0)
     return (d_floats,

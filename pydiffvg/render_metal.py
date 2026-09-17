@@ -1,13 +1,21 @@
 """
-    Metal (Apple GPU) backend for diffvg.
+    GPU backend for diffvg: colour forward and backward passes.
 
-    The flat scene pools (layout in pydiffvg/metal/common.metal) come either
-    from pydiffvg/scene_gpu.py (MLX arrays built on the GPU; the default; for
-    packed scenes, pydiffvg/packed.py, straight from the params arrays) or
-    from the C++ core's diffvg.Scene.export_flat() (numpy); every function
-    taking pools accepts both (see render_mlx._scene_pools). They are
-    rasterised by mx.fast.metal_kernel kernels whose shared code lives in
-    pydiffvg/metal/ (common.metal, geometry.metal, color.metal, backward.metal).
+    The flat scene pools (layout in pydiffvg/metal/common.metal, mirrored by
+    pydiffvg/cuda/common.cu) come either from pydiffvg/scene_gpu.py (MLX
+    arrays built on the GPU; the default; for packed scenes,
+    pydiffvg/packed.py, straight from the params arrays) or from the C++
+    core's diffvg.Scene.export_flat() (numpy); every function taking pools
+    accepts both (see render_mlx._scene_pools).
+
+    They are rasterised by kernels built through pydiffvg/gpu_backend.py,
+    which selects Apple Metal (pydiffvg/metal/*.metal, mx.fast.metal_kernel)
+    or NVIDIA CUDA (pydiffvg/cuda/*.cu, mx.fast.cuda_kernel). The kernel
+    bodies below are written ONCE, in the backend-neutral dialect documented
+    in gpu_backend.py: plain C plus DVG_THREAD_INDEX (thread index and, on
+    CUDA, the mandatory bounds check), DVG_ADD / DVG_STORE (atomics),
+    DVG_XYZ (float4 -> float3 swizzle) and DVG_CEIL. Nothing else in a body
+    differs between the two backends.
 
     Kernels: weight, render_color (forward); render_color_backward,
     sample_boundary, render_edge (backward: interior colour gradients, filter
@@ -20,14 +28,14 @@ import mlx.core as mx
 
 from . import render_mlx
 from . import metal_scene as ms
+from . import gpu_backend as gb
 
+# Kept for callers that used it; the live source directory is per backend.
 _METAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'metal')
-_HEADER_FILES = ('common.metal', 'geometry.metal', 'color.metal')
-_BACKWARD_HEADER_FILES = _HEADER_FILES + ('backward.metal',)
-_MIN_BUFFER = 8  # smaller inputs arrive in the `constant` address space
-
-_headers = {}
-_kernels = {}
+# Extension-free base names; gpu_backend picks metal/*.metal or cuda/*.cu.
+_HEADER_FILES = ('common', 'geometry', 'color')
+_BACKWARD_HEADER_FILES = _HEADER_FILES + ('backward',)
+_MIN_BUFFER = 8  # on Metal, smaller inputs arrive in the `constant` address space
 
 # ip slot used by the backward kernels only (slots 32-63 are free): 1 when the
 # screen-space translation gradient image is requested.
@@ -38,25 +46,16 @@ BS_I_STRIDE = 5
 
 
 def _load_header(files = _HEADER_FILES):
-    h = _headers.get(files)
-    if h is None:
-        parts = []
-        for name in files:
-            with open(os.path.join(_METAL_DIR, name), 'r') as f:
-                parts.append('// ---- %s ----\n' % name)
-                parts.append(f.read())
-        h = _headers[files] = '\n'.join(parts)
-    return h
+    return gb.header(files)
 
 
 def reset_kernel_cache():
-    """ Forget the loaded Metal sources and kernels (after editing .metal files). """
-    _headers.clear()
-    _kernels.clear()
+    """ Forget the loaded kernel sources and kernels (after editing them). """
+    gb.reset_kernel_cache()
 
 
 _WEIGHT_SOURCE = """
-    uint idx = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
     int width = ip[IP_W];
     int height = ip[IP_H];
@@ -65,7 +64,7 @@ _WEIGHT_SOURCE = """
     float2 pt = sample_position(s, int(idx), x, y);
     int ftype = ip[IP_FILTER_TYPE];
     float radius = filter_radius(s);
-    int ri = int(ceil(radius));
+    int ri = int(DVG_CEIL(radius));
     for (int dy = -ri; dy <= ri; dy++) {
         for (int dx = -ri; dx <= ri; dx++) {
             int xx = x + dx;
@@ -74,14 +73,14 @@ _WEIGHT_SOURCE = """
                 float xc = xx + 0.5f;
                 float yc = yy + 0.5f;
                 float w = compute_filter_weight(ftype, radius, xc - pt.x, yc - pt.y);
-                atomic_fetch_add_explicit(&weight_image[yy * width + xx], w, memory_order_relaxed);
+                DVG_ADD(weight_image, yy * width + xx, w);
             }
         }
     }
 """
 
 _WEIGHT_D_RADIUS_SOURCE = """
-    uint idx = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
     int width = ip[IP_W];
     int height = ip[IP_H];
@@ -90,7 +89,7 @@ _WEIGHT_D_RADIUS_SOURCE = """
     float2 pt = sample_position(s, int(idx), x, y);
     int ftype = ip[IP_FILTER_TYPE];
     float radius = filter_radius(s);
-    int ri = int(ceil(radius));
+    int ri = int(DVG_CEIL(radius));
     for (int dy = -ri; dy <= ri; dy++) {
         for (int dx = -ri; dx <= ri; dx++) {
             int xx = x + dx;
@@ -99,14 +98,14 @@ _WEIGHT_D_RADIUS_SOURCE = """
                 float xc = xx + 0.5f;
                 float yc = yy + 0.5f;
                 float dw = filter_weight_d_radius(ftype, radius, xc - pt.x, yc - pt.y);
-                atomic_fetch_add_explicit(&d_weight_image[yy * width + xx], dw, memory_order_relaxed);
+                DVG_ADD(d_weight_image, yy * width + xx, dw);
             }
         }
     }
 """
 
 _RENDER_COLOR_SOURCE = """
-    uint idx = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
     int width = ip[IP_W];
     int height = ip[IP_H];
@@ -126,7 +125,7 @@ _RENDER_COLOR_SOURCE = """
     float4 color = sample_color_scene(s, has_bg, bg, npt);
     int ftype = ip[IP_FILTER_TYPE];
     float radius = filter_radius(s);
-    int ri = int(ceil(radius));
+    int ri = int(DVG_CEIL(radius));
     for (int dy = -ri; dy <= ri; dy++) {
         for (int dx = -ri; dx <= ri; dx++) {
             int xx = x + dx;
@@ -139,10 +138,10 @@ _RENDER_COLOR_SOURCE = """
                     float fw = compute_filter_weight(ftype, radius, xc - pt.x, yc - pt.y);
                     float4 wc = fw * color / weight_sum;
                     int o = 4 * (yy * width + xx);
-                    atomic_fetch_add_explicit(&render_image[o], wc[0], memory_order_relaxed);
-                    atomic_fetch_add_explicit(&render_image[o + 1], wc[1], memory_order_relaxed);
-                    atomic_fetch_add_explicit(&render_image[o + 2], wc[2], memory_order_relaxed);
-                    atomic_fetch_add_explicit(&render_image[o + 3], wc[3], memory_order_relaxed);
+                    DVG_ADD(render_image, o, wc[0]);
+                    DVG_ADD(render_image, o + 1, wc[1]);
+                    DVG_ADD(render_image, o + 2, wc[2]);
+                    DVG_ADD(render_image, o + 3, wc[3]);
                 }
             }
         }
@@ -150,7 +149,7 @@ _RENDER_COLOR_SOURCE = """
 """
 
 _RENDER_COLOR_BACKWARD_SOURCE = """
-    uint idx = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
     int width = ip[IP_W];
     int height = ip[IP_H];
@@ -187,7 +186,7 @@ _RENDER_COLOR_BACKWARD_SOURCE = """
             color = bg;
             // Every sample of the pixel contributes: accumulate (as the CPU does).
             for (int k = 0; k < 4; k++) {
-                atomic_fetch_add_explicit(&d_background[4 * pix + k], d_color[k], memory_order_relaxed);
+                DVG_ADD(d_background, 4 * pix + k, d_color[k]);
             }
         }
     } else {
@@ -206,24 +205,24 @@ _RENDER_COLOR_BACKWARD_SOURCE = """
                                      group_fill_num_stops(s, gid), cpt, d_ci, g, d_translation_px);
             }
             for (int k = 0; k < g.n; k++) {
-                atomic_fetch_add_explicit(&d_floats[g.idx[k]], g.val[k], memory_order_relaxed);
+                DVG_ADD(d_floats, g.idx[k], g.val[k]);
             }
         }
         if (has_bg) {
-            atomic_fetch_add_explicit(&d_background[4 * pix], st.d_curr_color.x, memory_order_relaxed);
-            atomic_fetch_add_explicit(&d_background[4 * pix + 1], st.d_curr_color.y, memory_order_relaxed);
-            atomic_fetch_add_explicit(&d_background[4 * pix + 2], st.d_curr_color.z, memory_order_relaxed);
-            atomic_fetch_add_explicit(&d_background[4 * pix + 3], st.d_curr_alpha, memory_order_relaxed);
+            DVG_ADD(d_background, 4 * pix, st.d_curr_color.x);
+            DVG_ADD(d_background, 4 * pix + 1, st.d_curr_color.y);
+            DVG_ADD(d_background, 4 * pix + 2, st.d_curr_color.z);
+            DVG_ADD(d_background, 4 * pix + 3, st.d_curr_alpha);
         }
     }
     if (want_translation) {
-        atomic_fetch_add_explicit(&d_translation[2 * pix], d_translation_px.x, memory_order_relaxed);
-        atomic_fetch_add_explicit(&d_translation[2 * pix + 1], d_translation_px.y, memory_order_relaxed);
+        DVG_ADD(d_translation, 2 * pix, d_translation_px.x);
+        DVG_ADD(d_translation, 2 * pix + 1, d_translation_px.y);
     }
     // Filter radius (render_kernel splat loop)
     int ftype = ip[IP_FILTER_TYPE];
     float radius = filter_radius(s);
-    int ri = int(ceil(radius));
+    int ri = int(DVG_CEIL(radius));
     float d_radius = 0;
     for (int dy = -ri; dy <= ri; dy++) {
         for (int dx = -ri; dx <= ri; dx++) {
@@ -249,11 +248,11 @@ _RENDER_COLOR_BACKWARD_SOURCE = """
             }
         }
     }
-    atomic_fetch_add_explicit(&d_floats[ip[IP_FILTER_RADIUS_OFF]], d_radius, memory_order_relaxed);
+    DVG_ADD(d_floats, ip[IP_FILTER_RADIUS_OFF], d_radius);
 """
 
 _SAMPLE_BOUNDARY_SOURCE = """
-    uint idx = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
     int fo = BS_F_STRIDE * int(idx);
     int io = BS_I_STRIDE * int(idx);
@@ -262,37 +261,37 @@ _SAMPLE_BOUNDARY_SOURCE = """
     // Checked here so that the host never has to read the pools.
     int nts = ip[IP_NUM_TOTAL_SHAPES];
     if (ip[IP_NUM_GROUPS] <= 0 || nts <= 0 || !(floats[ip[IP_SAMPLE_CDF_OFF] + nts - 1] > 0.0f)) {
-        atomic_store_explicit(&bs_i[io + 1], -1, memory_order_relaxed);
+        DVG_STORE(bs_i, io + 1, -1);
         return;
     }
     BoundarySample b;
     bool ok = generate_boundary_sample(s, int(idx), b);
     if (!ok) {
-        atomic_store_explicit(&bs_i[io + 1], -1, memory_order_relaxed);
+        DVG_STORE(bs_i, io + 1, -1);
         return;
     }
-    atomic_store_explicit(&bs_f[fo], b.pt.x, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 1], b.pt.y, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 2], b.local_pt.x, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 3], b.local_pt.y, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 4], b.normal.x, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 5], b.normal.y, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 6], b.local_normal.x, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 7], b.local_normal.y, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 8], b.local_velocity_scale, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 9], b.t, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 10], b.data.path.t, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 11], b.pdf, memory_order_relaxed);
-    atomic_store_explicit(&bs_f[fo + 12], b.data.path.offset_dir, memory_order_relaxed);
-    atomic_store_explicit(&bs_i[io], b.shape_group_id, memory_order_relaxed);
-    atomic_store_explicit(&bs_i[io + 1], b.shape_id, memory_order_relaxed);
-    atomic_store_explicit(&bs_i[io + 2], b.data.path.base_point_id, memory_order_relaxed);
-    atomic_store_explicit(&bs_i[io + 3], b.data.path.point_id, memory_order_relaxed);
-    atomic_store_explicit(&bs_i[io + 4], b.data.is_stroke ? 1 : 0, memory_order_relaxed);
+    DVG_STORE(bs_f, fo, b.pt.x);
+    DVG_STORE(bs_f, fo + 1, b.pt.y);
+    DVG_STORE(bs_f, fo + 2, b.local_pt.x);
+    DVG_STORE(bs_f, fo + 3, b.local_pt.y);
+    DVG_STORE(bs_f, fo + 4, b.normal.x);
+    DVG_STORE(bs_f, fo + 5, b.normal.y);
+    DVG_STORE(bs_f, fo + 6, b.local_normal.x);
+    DVG_STORE(bs_f, fo + 7, b.local_normal.y);
+    DVG_STORE(bs_f, fo + 8, b.local_velocity_scale);
+    DVG_STORE(bs_f, fo + 9, b.t);
+    DVG_STORE(bs_f, fo + 10, b.data.path.t);
+    DVG_STORE(bs_f, fo + 11, b.pdf);
+    DVG_STORE(bs_f, fo + 12, b.data.path.offset_dir);
+    DVG_STORE(bs_i, io, b.shape_group_id);
+    DVG_STORE(bs_i, io + 1, b.shape_id);
+    DVG_STORE(bs_i, io + 2, b.data.path.base_point_id);
+    DVG_STORE(bs_i, io + 3, b.data.path.point_id);
+    DVG_STORE(bs_i, io + 4, b.data.is_stroke ? 1 : 0);
 """
 
 _RENDER_EDGE_SOURCE = """
-    uint idx = thread_position_in_grid.x;
+    DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
     int fo = BS_F_STRIDE * int(idx);
     int io = BS_I_STRIDE * int(idx);
@@ -370,95 +369,50 @@ _RENDER_EDGE_SOURCE = """
     accumulate_boundary_gradient(s, shape_id, contrib, t, local_normal, data, shape_group_id,
                                  local_boundary_pt, normal, local_velocity_scale, g);
     for (int k = 0; k < g.n; k++) {
-        atomic_fetch_add_explicit(&d_floats[g.idx[k]], g.val[k], memory_order_relaxed);
+        DVG_ADD(d_floats, g.idx[k], g.val[k]);
     }
     if (ip[IP_WANT_D_TRANSLATION] != 0) {
-        atomic_fetch_add_explicit(&d_translation[2 * pix], normal.x * contrib, memory_order_relaxed);
-        atomic_fetch_add_explicit(&d_translation[2 * pix + 1], normal.y * contrib, memory_order_relaxed);
+        DVG_ADD(d_translation, 2 * pix, normal.x * contrib);
+        DVG_ADD(d_translation, 2 * pix + 1, normal.y * contrib);
     }
 """
 
-_BACKWARD_PRELUDE = """
-constant int IP_WANT_D_TRANSLATION = %d;
-constant int BS_F_STRIDE = %d;
-constant int BS_I_STRIDE = %d;
-""" % (IP_WANT_D_TRANSLATION, BS_F_STRIDE, BS_I_STRIDE)
+# Compile-time constants the backward kernel bodies reference; gpu_backend
+# spells them for each backend (constant / static constexpr).
+_BACKWARD_CONSTANTS = (('IP_WANT_D_TRANSLATION', IP_WANT_D_TRANSLATION),
+                       ('BS_F_STRIDE', BS_F_STRIDE),
+                       ('BS_I_STRIDE', BS_I_STRIDE))
+
+# name -> (header files, header constants, input names, output names, body)
+_KERNEL_DEFS = {
+    'weight': (_HEADER_FILES, (),
+               ['ip', 'ints', 'floats'], ['weight_image'], _WEIGHT_SOURCE),
+    'weight_d_radius': (_HEADER_FILES, (),
+                        ['ip', 'ints', 'floats'], ['d_weight_image'], _WEIGHT_D_RADIUS_SOURCE),
+    'render_color': (_HEADER_FILES, (),
+                     ['ip', 'ints', 'floats', 'weight_image', 'background'],
+                     ['render_image'], _RENDER_COLOR_SOURCE),
+    'render_color_backward': (_BACKWARD_HEADER_FILES, _BACKWARD_CONSTANTS,
+                              ['ip', 'ints', 'floats', 'weight_image', 'd_weight_image',
+                               'd_render_image', 'background'],
+                              ['d_floats', 'd_background', 'd_translation'],
+                              _RENDER_COLOR_BACKWARD_SOURCE),
+    'sample_boundary': (_BACKWARD_HEADER_FILES, _BACKWARD_CONSTANTS,
+                        ['ip', 'ints', 'floats'], ['bs_f', 'bs_i'], _SAMPLE_BOUNDARY_SOURCE),
+    'render_edge': (_BACKWARD_HEADER_FILES, _BACKWARD_CONSTANTS,
+                    ['ip', 'ints', 'floats', 'bs_f', 'bs_i', 'weight_image',
+                     'd_render_image', 'background'],
+                    ['d_floats', 'd_translation'], _RENDER_EDGE_SOURCE),
+}
 
 
 def _kernel(name):
-    k = _kernels.get(name)
-    if k is not None:
-        return k
-    header = _load_header()
-    backward_header = None
-    if name in ('render_color_backward', 'sample_boundary', 'render_edge'):
-        backward_header = _load_header(_BACKWARD_HEADER_FILES) + _BACKWARD_PRELUDE
-    if name == 'weight':
-        k = mx.fast.metal_kernel(
-            name = 'diffvg_weight',
-            input_names = ['ip', 'ints', 'floats'],
-            output_names = ['weight_image'],
-            source = _WEIGHT_SOURCE,
-            header = header,
-            ensure_row_contiguous = True,
-            atomic_outputs = True,
-            compile_options = {'math_mode': 'fast'})
-    elif name == 'weight_d_radius':
-        k = mx.fast.metal_kernel(
-            name = 'diffvg_weight_d_radius',
-            input_names = ['ip', 'ints', 'floats'],
-            output_names = ['d_weight_image'],
-            source = _WEIGHT_D_RADIUS_SOURCE,
-            header = header,
-            ensure_row_contiguous = True,
-            atomic_outputs = True,
-            compile_options = {'math_mode': 'fast'})
-    elif name == 'render_color':
-        k = mx.fast.metal_kernel(
-            name = 'diffvg_render_color',
-            input_names = ['ip', 'ints', 'floats', 'weight_image', 'background'],
-            output_names = ['render_image'],
-            source = _RENDER_COLOR_SOURCE,
-            header = header,
-            ensure_row_contiguous = True,
-            atomic_outputs = True,
-            compile_options = {'math_mode': 'fast'})
-    elif name == 'render_color_backward':
-        k = mx.fast.metal_kernel(
-            name = 'diffvg_render_color_backward',
-            input_names = ['ip', 'ints', 'floats', 'weight_image', 'd_weight_image',
-                           'd_render_image', 'background'],
-            output_names = ['d_floats', 'd_background', 'd_translation'],
-            source = _RENDER_COLOR_BACKWARD_SOURCE,
-            header = backward_header,
-            ensure_row_contiguous = True,
-            atomic_outputs = True,
-            compile_options = {'math_mode': 'fast'})
-    elif name == 'sample_boundary':
-        k = mx.fast.metal_kernel(
-            name = 'diffvg_sample_boundary',
-            input_names = ['ip', 'ints', 'floats'],
-            output_names = ['bs_f', 'bs_i'],
-            source = _SAMPLE_BOUNDARY_SOURCE,
-            header = backward_header,
-            ensure_row_contiguous = True,
-            atomic_outputs = True,
-            compile_options = {'math_mode': 'fast'})
-    elif name == 'render_edge':
-        k = mx.fast.metal_kernel(
-            name = 'diffvg_render_edge',
-            input_names = ['ip', 'ints', 'floats', 'bs_f', 'bs_i', 'weight_image',
-                           'd_render_image', 'background'],
-            output_names = ['d_floats', 'd_translation'],
-            source = _RENDER_EDGE_SOURCE,
-            header = backward_header,
-            ensure_row_contiguous = True,
-            atomic_outputs = True,
-            compile_options = {'math_mode': 'fast'})
-    else:
+    """ The kernel for the active GPU backend (built once, cached there). """
+    try:
+        files, constants, inputs, outputs, source = _KERNEL_DEFS[name]
+    except KeyError:
         raise KeyError(name)
-    _kernels[name] = k
-    return k
+    return gb.kernel(name, inputs, outputs, source, files, constants)
 
 
 def _pad(a, n = _MIN_BUFFER):
@@ -476,8 +430,9 @@ def _seed_bits(seed):
     return int(lo), int(hi)
 
 
-def _threadgroup(n):
-    return (min(256, max(1, n)), 1, 1)
+def _threadgroup(n, kernel = None):
+    """ Launch block for n threads (Metal 256; CUDA smaller, see gpu_backend). """
+    return gb.threadgroup(n, kernel)
 
 
 def is_supported(output_type, use_prefiltering, eval_positions):
@@ -550,7 +505,6 @@ def prepare_flat(ip, ints, floats, width, height, num_samples_x, num_samples_y,
         flat['weight_image'] = _kernel('weight')(
             inputs = [flat['ip_m'], ints_m, floats_m],
             grid = (num_samples, 1, 1),
-            threadgroup = _threadgroup(num_samples),
             output_shapes = [(max(num_pixels, _MIN_BUFFER),)],
             output_dtypes = [mx.float32],
             init_value = 0)[0]
@@ -565,7 +519,6 @@ def render_color_prepared(flat):
     render_image = _kernel('render_color')(
         inputs = [flat['ip_m'], flat['ints_m'], flat['floats_m'], flat['weight_image'], flat['bg_m']],
         grid = (num_samples, 1, 1),
-        threadgroup = _threadgroup(num_samples),
         output_shapes = [(width * height * 4,)],
         output_dtypes = [mx.float32],
         init_value = 0)[0]
@@ -597,7 +550,6 @@ def weight_d_radius_image(flat):
         d_w = flat['d_weight_image'] = _kernel('weight_d_radius')(
             inputs = [flat['ip_m'], flat['ints_m'], flat['floats_m']],
             grid = (num_samples, 1, 1),
-            threadgroup = _threadgroup(num_samples),
             output_shapes = [(max(flat['width'] * flat['height'], _MIN_BUFFER),)],
             output_dtypes = [mx.float32],
             init_value = 0)[0]
@@ -655,7 +607,6 @@ def render_backward_prepared(flat, d_render_image, want_translation = False, edg
     d_img = _pad(mx.array(d_render_image).astype(mx.float32) if not isinstance(d_render_image, mx.array)
                  else d_render_image.astype(mx.float32))
     grid = (num_samples, 1, 1)
-    tg = _threadgroup(num_samples)
     tr_size = max(2 * num_pixels, _MIN_BUFFER) if want_translation else _MIN_BUFFER
     bg_size = max(4 * num_pixels, _MIN_BUFFER) if has_bg else _MIN_BUFFER
     d_weight_image = weight_d_radius_image(flat)
@@ -663,7 +614,6 @@ def render_backward_prepared(flat, d_render_image, want_translation = False, edg
         inputs = [ip_m, flat['ints_m'], flat['floats_m'], flat['weight_image'], d_weight_image,
                   d_img, flat['bg_m']],
         grid = grid,
-        threadgroup = tg,
         output_shapes = [(nf,), (bg_size,), (tr_size,)],
         output_dtypes = [mx.float32, mx.float32, mx.float32],
         init_value = 0)
@@ -673,7 +623,6 @@ def render_backward_prepared(flat, d_render_image, want_translation = False, edg
         bs_f, bs_i = _kernel('sample_boundary')(
             inputs = [ip_m, flat['ints_m'], flat['floats_m']],
             grid = grid,
-            threadgroup = tg,
             output_shapes = [(max(BS_F_STRIDE * num_samples, _MIN_BUFFER),),
                              (max(BS_I_STRIDE * num_samples, _MIN_BUFFER),)],
             output_dtypes = [mx.float32, mx.int32],
@@ -683,7 +632,6 @@ def render_backward_prepared(flat, d_render_image, want_translation = False, edg
             inputs = [ip_m, flat['ints_m'], flat['floats_m'], bs_f, bs_i, flat['weight_image'],
                       d_img, flat['bg_m']],
             grid = grid,
-            threadgroup = tg,
             output_shapes = [(nf,), (tr_size,)],
             output_dtypes = [mx.float32, mx.float32],
             init_value = 0)
