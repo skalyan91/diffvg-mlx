@@ -421,7 +421,8 @@ class Kernel:
 
 
 def kernel(name, input_names, output_names, source, header_files, constants = (),
-           shared_memory = 0, ensure_row_contiguous = True, backend = None):
+           shared_memory = 0, ensure_row_contiguous = True, backend = None,
+           math_mode = 'fast', atomic_outputs = True):
     """
         Builds (and caches) a kernel from a backend-neutral body.
 
@@ -434,19 +435,24 @@ def kernel(name, input_names, output_names, source, header_files, constants = ()
         constants     (name, int) pairs compiled into the header.
         shared_memory dynamic shared memory, CUDA only (ignored on Metal).
 
-        Per-backend arguments, and why:
-          Metal  atomic_outputs=True    -- every output is device atomic<T>,
-                                           which is what DVG_ADD/DVG_STORE emit
-                 compile_options math_mode 'fast'
-                                        -- mandatory: the AGX code generator
-                                           aborts on these kernels in the other
-                                           modes (see DESIGN.md)
-          CUDA   neither exists on mx.fast.cuda_kernel; nvrtc defaults apply
-                 (IEEE division and sqrt, fmad on), which sit closer to the
-                 C++ CPU reference than Metal's fast math does.
+        Metal only (both are ignored on CUDA, where mx.fast.cuda_kernel has
+        neither and nvrtc's defaults -- IEEE division and sqrt, fmad on -- are
+        the ones wanted, sitting closer to the C++ CPU reference than Metal's
+        fast math does):
+
+        math_mode      'fast' (the default) is mandatory for the rasterisation
+                       kernels: the AGX code generator aborts on them in every
+                       other mode (see DESIGN.md). The scene kernels pass
+                       'safe' instead, because fast math replaces divisions
+                       with reciprocal approximations and so breaks bit parity
+                       with the C++ core.
+        atomic_outputs True (the default) makes every output device atomic<T>,
+                       which is what DVG_ADD / DVG_STORE emit. Pass False for a
+                       kernel that writes outputs plainly or reads its own
+                       output back, as the scene 'paths' kernel does.
     """
     backend = backend or require_backend()
-    key = (backend, name)
+    key = (backend, name, math_mode, atomic_outputs)
     k = _kernels.get(key)
     if k is not None:
         return k
@@ -460,8 +466,8 @@ def kernel(name, input_names, output_names, source, header_files, constants = ()
             source = source,
             header = hdr,
             ensure_row_contiguous = ensure_row_contiguous,
-            atomic_outputs = True,
-            compile_options = {'math_mode': 'fast'})
+            atomic_outputs = atomic_outputs,
+            compile_options = {'math_mode': math_mode})
     else:
         fn = mx.fast.cuda_kernel(
             name = 'diffvg_' + name,

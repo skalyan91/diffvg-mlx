@@ -378,33 +378,6 @@ _KERNEL_DEFS = {
 _kernels = {}          # (backend, name) -> kernel
 
 
-class _SafeMetalKernel:
-    """
-        mx.fast.metal_kernel with the call signature of gpu_backend.Kernel.
-
-        The scene kernels cannot go through gpu_backend.kernel() on Metal:
-        that builds every Metal kernel with atomic_outputs (so an output buffer
-        can only be written through atomic_store, and the 'paths' kernel reads
-        its own output back) and with math_mode 'fast', which the rasterisation
-        kernels need but the pools must not have -- fast math replaces the
-        divisions with reciprocal approximations and breaks bit parity with the
-        C++ core. On CUDA neither option exists, nvrtc's defaults are the ones
-        wanted, and gpu_backend.kernel() is used unchanged; should it ever grow
-        math_mode / atomic_outputs arguments, this class and the Metal branch
-        of _kernel() disappear.
-    """
-    __slots__ = ('fn',)
-
-    def __init__(self, fn):
-        self.fn = fn
-
-    def __call__(self, inputs, grid, output_shapes, output_dtypes, init_value = None,
-                 threadgroup = None):
-        kwargs = {} if init_value is None else {'init_value': init_value}
-        return self.fn(inputs = inputs, grid = grid, threadgroup = threadgroup,
-                       output_shapes = output_shapes, output_dtypes = output_dtypes, **kwargs)
-
-
 def supports_backend(backend):
     """
         Whether this module can build the pools on a GPU backend (render_mlx
@@ -420,18 +393,13 @@ def _kernel(name):
     k = _kernels.get(key)
     if k is None:
         inputs, outputs, source = _KERNEL_DEFS[name]
-        if backend == 'cuda':
-            k = gb.kernel('scene_gpu_' + name, inputs, outputs, source, _HEADER_FILES)
-        else:
-            k = _SafeMetalKernel(mx.fast.metal_kernel(
-                name = 'diffvg_scene_gpu_' + name,
-                input_names = list(inputs),
-                output_names = list(outputs),
-                source = gb.expand_source(source, backend),
-                header = gb.header(_HEADER_FILES, backend = backend),
-                ensure_row_contiguous = True,
-                atomic_outputs = False,
-                compile_options = {'math_mode': 'safe'}))
+        # Metal-only arguments (ignored on CUDA, whose defaults are the ones
+        # wanted): safe math, because fast math replaces the divisions with
+        # reciprocal approximations and breaks bit parity with the C++ core,
+        # and plain outputs, because the 'paths' kernel reads its own output
+        # back, which an atomic<T> buffer does not allow.
+        k = gb.kernel('scene_gpu_' + name, inputs, outputs, source, _HEADER_FILES,
+                      math_mode = 'safe', atomic_outputs = False)
         _kernels[key] = k
     return k
 
