@@ -262,3 +262,39 @@ If you use diffvg in your academic work, please cite
     year = {2020}
 }
 ```
+
+# Gradient accuracy
+Two effects make an analytic gradient differ from a finite difference. Neither is a defect of the MLX port: the first is inherent to the estimator of upstream diffvg, the second is a numerical limit of the C++ core that the GPU kernels happen to avoid.
+
+## A discontinuous incoming gradient biases the boundary term
+The boundary integral needs the value of the incoming gradient image *at the edge*, and `gather_d_color` (`diffvg.cpp`) reconstructs it from the pixels around the boundary point. A pixel that contains the edge holds a value averaged across it, so when the incoming gradient itself jumps at that edge, the reconstructed value is wrong by roughly the size of the jump. Measured on a filled circle, differentiating the radius, with the incoming gradient supplied explicitly through `mx.vjp`:
+
+| Incoming gradient | Error against a central finite difference |
+|---|---|
+| Constant | +0.05% |
+| Smooth ramp across the canvas | +0.02% |
+| Smooth radial falloff | +0.19% |
+| Jump three or more pixels away from the differentiated edge | +0.03% |
+| Jump one pixel away | +1.96% |
+| Jump exactly on the differentiated edge | +11.5% |
+
+The error needs the jump to coincide with the boundary being differentiated, and it decays within about one pixel. **The gradient of any loss that is nonlinear in the image hits this**, because such a gradient jumps wherever the image does: for an L2 loss it is `2 * image`. A loss linear in the image has a constant incoming gradient and is unaffected, which is the case the paper claims, and which holds here to 0.05% (d/dr of the alpha sum is 251.33 against `2 * pi * r` = 251.327).
+
+Both backends and the C++ core agree with each other on this to a fraction of a percent, so it is a property of the algorithm rather than of any one implementation. Upstream diffvg reproduces the same figures.
+
+## The C++ core loses accuracy over many boundary samples
+The C++ core accumulates every boundary sample into one float32 gradient with a sequential atomic add. The rounding error of that summation grows with the number of samples, and it depends only on the **total** count of boundary samples, `width * height * num_samples_x * num_samples_y`, not on how that total divides between resolution and samples per pixel:
+
+| Total boundary samples | Canvas and samples | C++ core | GPU kernels |
+|---|---|---|---|
+| 262,144 | 32² at 16×16 | +0.186% | −0.000% |
+| 262,144 | 128² at 4×4 | +0.182% | −0.005% |
+| 1,048,576 | 64² at 16×16 | +0.613% | +0.001% |
+| 1,048,576 | 128² at 8×8 | +0.613% | +0.001% |
+| 4,194,304 | 128² at 16×16 | +1.548% | −0.000% |
+
+The GPU kernels sort the boundary samples and reduce them with MLX operations instead of adding them one at a time, which keeps them accurate: flat to 16×16 samples per pixel, and −0.06% at 32×32. On the C++ core, keeping the total under about a million boundary samples holds the error near 0.6%; the usual 2×2 or 4×4 samples per pixel at ordinary canvas sizes stays well inside that.
+
+## Upstream bugs not fixed here
+- **The boundary term is scaled by the canvas size, the sample count by the render size.** `diffvg.cpp` divides the gathered gradient by `canvas_width * canvas_height` while drawing `width * height * num_samples_x * num_samples_y` samples, so rendering at a resolution other than the canvas size scales the boundary gradients by the ratio between them. Interior gradients are unaffected.
+- **The radius of a stroked circle has the wrong sign on the inner edge** ([diffvg issue #39](https://github.com/BachiLi/diffvg/issues/39)). The author confirmed the bug and pushed a fix to an unmerged `circle_stroke_fix` branch, noting that ellipses need the same correction. This fork carries the upstream behaviour.
