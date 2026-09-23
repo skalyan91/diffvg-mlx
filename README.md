@@ -315,7 +315,7 @@ The fix follows from that: `render()` runs the boundary pass of the C++ core in 
 | 128² single circle at 8×8 | +0.613% | −0.011% |
 | 128² single circle at 16×16 | +1.548% | −0.013% |
 
-The GPU kernels are unaffected: they reduce the per-sample contributions with MLX operations rather than adding them one at a time.
+The Metal kernels do not show the drift (−0.000% at 4×4 through −0.002% at 16×16, and −0.059% at 32×32), but **the CUDA kernels do**, and to the same degree the C++ core used to: +0.613% at 8×8 and +1.548% at 16×16 on an RTX 4090, against a C++ core that now reads −0.011% and −0.013% on the same machine. Both backends stage each sample into a fixed-size buffer and flush it with a float atomic add, through identical code, so what makes one drift and not the other has not been established. The CUDA path is not fixed.
 
 ## Stroked circles and ellipses
 [Upstream issue #39](https://github.com/BachiLi/diffvg/issues/39) reports the wrong sign for the radius gradient on the inner flank of a stroked circle: the normal there points towards the centre while growing the radius pushes the flank outwards, so the velocity of Reynolds transport theorem needs the opposite sign. This fork already projects the radial velocity onto the normal, which gives the right sign on both flanks, and the ellipse form projects each axis of the velocity the same way. On a stroked shape of stroke width 6, the radius gradient of the two backends agrees with the C++ core to +0.34% for a circle and +0.16% for an ellipse, and neither shows the sign error of the report; those figures compare the implementations with each other, not with an exact reference, for the reason given above.
