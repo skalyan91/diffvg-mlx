@@ -147,13 +147,14 @@ Measured against the C++ core on an RTX 3090 (`pydiffvg/cuda/README-porting.md` 
 
 | Check | Result |
 |---|---|
-| Colour, 2×2 and 4×4 samples | bit-identical |
+| Colour, 1×1 and 2×2 samples | bit-identical |
+| Colour, 4×4 and above | 6e-08 at 4×4, 1e-06 at 16×16 |
 | `tiger.svg` (495×510), colour | 1.2e-07 maximum difference, no pixel past 1e-4 |
 | `tiger.svg`, prefiltered | 7.5e-05, no pixel past 1e-4 |
 | `hawaii.svg` (3110×2563), colour | 15 of 7,970,930 pixels past 1e-4, and none of them under a second seed |
 | Gradients (radius, centre, colour, stroke width) | agree to 1.8e-04 relative or better |
 
-The `hawaii.svg` outliers are edge samples landing on either side of coincident edges, not a difference in geometry: a different seed moves them, and no pixel diverges under both seeds. Prefiltered output is the one path that is not bit-identical on either backend (6.2e-06 on Metal, 7.5e-05 on CUDA); the cause has not been traced.
+The `hawaii.svg` outliers are edge samples landing on either side of coincident edges, not a difference in geometry: a different seed moves them, and no pixel diverges under both seeds. Sampled colour output is bit-identical to the C++ core at 1×1 and 2×2 samples; from 4×4 upwards the two differ by the last ulp or two (5.96e-08 at 4×4, 2.38e-07 at 8×8, 1.01e-06 at 16×16 on Metal), the accumulation order over samples differing between the two. Prefiltered output differs by more (6.2e-06 on Metal, 7.5e-05 on CUDA); the cause has not been traced.
 
 A `mx.value_and_grad` step over a two-shape scene at 256×256 with 2×2 samples takes 8.9 ms on the RTX 3090 against 661.7 ms on that machine's CPU core.
 
@@ -281,10 +282,10 @@ The reference that settles both is geometric: for a circle of radius r, the deri
 
 **The gradients are correct in every case, and the finite differences are what is wrong.** A hand integration is no safer: assuming the arc-weighted mean coverage of the boundary pixels to be 0.5 gives 387 for the second row, where quadrature gives 0.5605 and hence 433.89.
 
-## The C++ core loses accuracy over many boundary samples
-The gradients of the C++ core drift away from the exact value as the number of boundary samples grows, while the GPU kernels stay on it. The drift depends only on the **total** count of boundary samples, `width * height * num_samples_x * num_samples_y`, not on how that total divides between resolution and samples per pixel:
+## The float accumulator of the C++ core (fixed)
+The gradients of the C++ core used to drift away from the exact value as the number of boundary samples grew, while the GPU kernels stayed on it. The drift depended only on the **total** count of boundary samples, `width * height * num_samples_x * num_samples_y`, not on how that total divided between resolution and samples per pixel:
 
-| Total boundary samples | Canvas and samples | C++ core | GPU kernels |
+| Total boundary samples | Canvas and samples | C++ core, before the fix | GPU kernels |
 |---|---|---|---|
 | 262,144 | 32² at 16×16 | +0.186% | −0.000% |
 | 262,144 | 128² at 4×4 | +0.182% | −0.005% |
@@ -292,7 +293,7 @@ The gradients of the C++ core drift away from the exact value as the number of b
 | 1,048,576 | 128² at 8×8 | +0.613% | +0.001% |
 | 4,194,304 | 128² at 16×16 | +1.548% | −0.000% |
 
-The GPU kernels stay on the exact value to 16×16 samples per pixel, and reach −0.06% at 32×32. On the C++ core, keeping the total under about a million boundary samples holds the error near 0.6%; the usual 2×2 or 4×4 samples per pixel at ordinary canvas sizes stays well inside that.
+The GPU kernels stay on the exact value to 16×16 samples per pixel, and reach −0.06% at 32×32.
 
 The cause is the float32 accumulator. Both paths draw the same boundary samples, from the same `init_pcg32(idx, seed)` streams, and compute the same per-sample weight; the C++ core then adds every contribution into one float32 parameter gradient, while the GPU kernels reduce the per-sample contributions with MLX operations. What matters is the number of additions reaching a single accumulator, not the number of samples. Spreading the same 4,194,304 boundary samples over k identical circles, so that each radius accumulator receives one k-th of the additions:
 
@@ -304,6 +305,17 @@ The cause is the float32 accumulator. Both paths draw the same boundary samples,
 | 64 | +0.067% | −0.001% |
 
 The error falls with the length of each summation while the sample count stays fixed, which is the signature of the accumulator rather than of the sampling.
+
+The fix follows from that: `render()` runs the boundary pass of the C++ core in chunks of 16,384 samples and drains the float accumulators into doubles between them, which shortens every summation by the number of chunks and leaves the gradients themselves untouched. The same measurements after the fix:
+
+| Case | Before | After |
+|---|---|---|
+| 4,194,304 samples into one accumulator | −0.966% | −0.017% |
+| the same samples over 4 shapes | −0.244% | −0.003% |
+| 128² single circle at 8×8 | +0.613% | −0.011% |
+| 128² single circle at 16×16 | +1.548% | −0.013% |
+
+The GPU kernels are unaffected: they reduce the per-sample contributions with MLX operations rather than adding them one at a time.
 
 ## Stroked circles and ellipses
 [Upstream issue #39](https://github.com/BachiLi/diffvg/issues/39) reports the wrong sign for the radius gradient on the inner flank of a stroked circle: the normal there points towards the centre while growing the radius pushes the flank outwards, so the velocity of Reynolds transport theorem needs the opposite sign. This fork already projects the radial velocity onto the normal, which gives the right sign on both flanks, and the ellipse form projects each axis of the velocity the same way. On a stroked shape of stroke width 6, the radius gradient of the two backends agrees with the C++ core to +0.34% for a circle and +0.16% for an ellipse, and neither shows the sign error of the report; those figures compare the implementations with each other, not with an exact reference, for the reason given above.

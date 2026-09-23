@@ -22,6 +22,7 @@
 #include <pybind11/stl.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -1697,7 +1698,8 @@ struct sample_boundary_kernel {
 };
 
 struct render_edge_kernel {
-    DEVICE void operator()(int idx) {
+    DEVICE void operator()(int chunk_idx) {
+        auto idx = chunk_idx + idx_offset;
         auto bid = boundary_ids[idx];
         if (boundary_samples[bid].shape_id == -1) {
             return;
@@ -1787,7 +1789,100 @@ struct render_edge_kernel {
     int height;
     int num_samples_x;
     int num_samples_y;
+    // First sample of the chunk this launch covers. The gradients are
+    // accumulated in float, so the rounding error grows with the number of
+    // additions that reach one accumulator; render() therefore runs the pass in
+    // chunks and drains the accumulators into doubles between them.
+    int idx_offset;
 };
+
+// Every float the boundary pass accumulates into. All of them live in
+// scene.buffer (scene.cpp allocates the gradient structures there, colours
+// included), so the list can be built from the scene alone.
+inline void collect_gradient_floats(const Scene &scene, std::vector<float*> &out) {
+    out.clear();
+    auto push_color = [&](ColorType type, void *ptr) {
+        if (ptr == nullptr) {
+            return;
+        }
+        switch (type) {
+            case ColorType::Constant: {
+                auto c = (Constant*)ptr;
+                out.push_back(&c->color[0]);
+                out.push_back(&c->color[1]);
+                out.push_back(&c->color[2]);
+                out.push_back(&c->color[3]);
+                break;
+            } case ColorType::LinearGradient: {
+                auto c = (LinearGradient*)ptr;
+                out.push_back(&c->begin[0]); out.push_back(&c->begin[1]);
+                out.push_back(&c->end[0]);   out.push_back(&c->end[1]);
+                for (int i = 0; i < c->num_stops; i++) {
+                    out.push_back(&c->stop_offsets[i]);
+                }
+                for (int i = 0; i < 4 * c->num_stops; i++) {
+                    out.push_back(&c->stop_colors[i]);
+                }
+                break;
+            } case ColorType::RadialGradient: {
+                auto c = (RadialGradient*)ptr;
+                out.push_back(&c->center[0]); out.push_back(&c->center[1]);
+                out.push_back(&c->radius[0]); out.push_back(&c->radius[1]);
+                for (int i = 0; i < c->num_stops; i++) {
+                    out.push_back(&c->stop_offsets[i]);
+                }
+                for (int i = 0; i < 4 * c->num_stops; i++) {
+                    out.push_back(&c->stop_colors[i]);
+                }
+                break;
+            }
+        }
+    };
+    for (int shape_id = 0; shape_id < scene.num_shapes; shape_id++) {
+        Shape &d_shape = scene.d_shapes[shape_id];
+        out.push_back(&d_shape.stroke_width);
+        switch (d_shape.type) {
+            case ShapeType::Circle: {
+                auto c = (Circle*)d_shape.ptr;
+                out.push_back(&c->radius);
+                out.push_back(&c->center[0]);
+                out.push_back(&c->center[1]);
+                break;
+            } case ShapeType::Ellipse: {
+                auto e = (Ellipse*)d_shape.ptr;
+                out.push_back(&e->radius[0]); out.push_back(&e->radius[1]);
+                out.push_back(&e->center[0]); out.push_back(&e->center[1]);
+                break;
+            } case ShapeType::Path: {
+                auto p = (Path*)d_shape.ptr;
+                for (int i = 0; i < 2 * p->num_points; i++) {
+                    out.push_back(&p->points[i]);
+                }
+                if (p->thickness != nullptr) {
+                    for (int i = 0; i < p->num_points; i++) {
+                        out.push_back(&p->thickness[i]);
+                    }
+                }
+                break;
+            } case ShapeType::Rect: {
+                auto r = (Rect*)d_shape.ptr;
+                out.push_back(&r->p_min[0]); out.push_back(&r->p_min[1]);
+                out.push_back(&r->p_max[0]); out.push_back(&r->p_max[1]);
+                break;
+            }
+        }
+    }
+    for (int group_id = 0; group_id < scene.num_shape_groups; group_id++) {
+        ShapeGroup &d_group = scene.d_shape_groups[group_id];
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                out.push_back(&d_group.shape_to_canvas(i, j));
+            }
+        }
+        push_color(d_group.fill_color_type, d_group.fill_color);
+        push_color(d_group.stroke_color_type, d_group.stroke_color);
+    }
+}
 
 void render(std::shared_ptr<Scene> scene,
             ptr<float> background_image,
@@ -1936,19 +2031,58 @@ void render(std::shared_ptr<Scene> scene,
             // Don't need to sort for CPU, we are not using SIMD hardware anyway.
             // thrust::sort_by_key(thrust::host, morton_codes, morton_codes + num_samples, boundary_ids);
         }
-        parallel_for(render_edge_kernel{
-            get_scene_data(*scene.get()),
-            background_image.get(),
-            boundary_samples,
-            boundary_ids,
-            weight_image,
-            d_render_image.get(),
-            d_translation.get(),
-            width,
-            height,
-            num_samples_x,
-            num_samples_y
-        }, num_samples, scene->use_gpu);
+        // The boundary gradients are accumulated in float, so the rounding
+        // error grows with the number of additions reaching one accumulator,
+        // not with the number of samples: a single shape at 128x128 with 16x16
+        // samples came out 1% off. Run the pass in chunks and drain the
+        // accumulators into doubles between them, which cuts the error by the
+        // number of chunks. The chunk size keeps each run near the length at
+        // which the float sums are still accurate.
+        const int edge_chunk = 16384;
+        std::vector<float*> d_floats;
+        std::vector<double> base, acc;
+        auto chunked = !scene->use_gpu && num_samples > edge_chunk;
+        if (chunked) {
+            collect_gradient_floats(*scene.get(), d_floats);
+            base.resize(d_floats.size());
+            acc.assign(d_floats.size(), 0.0);
+            // Hold what the interior passes accumulated, and start the boundary
+            // pass from zero so that only its own sums are drained.
+            for (size_t i = 0; i < d_floats.size(); i++) {
+                base[i] = *d_floats[i];
+                *d_floats[i] = 0.f;
+            }
+        }
+        for (int offset = 0; offset < num_samples; offset += edge_chunk) {
+            auto count = chunked ? std::min(edge_chunk, num_samples - offset)
+                                 : num_samples;
+            parallel_for(render_edge_kernel{
+                get_scene_data(*scene.get()),
+                background_image.get(),
+                boundary_samples,
+                boundary_ids,
+                weight_image,
+                d_render_image.get(),
+                d_translation.get(),
+                width,
+                height,
+                num_samples_x,
+                num_samples_y,
+                chunked ? offset : 0
+            }, count, scene->use_gpu);
+            if (!chunked) {
+                break;
+            }
+            for (size_t i = 0; i < d_floats.size(); i++) {
+                acc[i] += *d_floats[i];
+                *d_floats[i] = 0.f;
+            }
+        }
+        if (chunked) {
+            for (size_t i = 0; i < d_floats.size(); i++) {
+                *d_floats[i] = float(base[i] + acc[i]);
+            }
+        }
         if (scene->use_gpu) {
 #ifdef __CUDACC__
             checkCuda(cudaFree(boundary_samples));
