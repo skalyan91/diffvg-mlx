@@ -335,7 +335,16 @@ The colour and edge kernels therefore scatter their gradients over several copie
 | 128² single circle at 16×16 | +1.548% | −0.051% |
 | `d/dr` of the alpha sum against `2 pi r` = 376.991 | 381.320 | 377.000 |
 
-The signed distance and prefiltered kernels (`pydiffvg/render_metal_stage3.py`) still accumulate the old way, so their gradients carry the same drift on CUDA at high sample counts.
+The signed distance and prefiltered kernels (`pydiffvg/render_metal_stage3.py`) scatter the same way. Their drift was never measured on its own, so there is no before-and-after to show for them: the copies are there because those kernels accumulate through the same float atomic, and what the measurements establish is only that they still agree with the C++ core with the copies in place (prefiltered parity 1.41e-05 for a box and a tent filter, unchanged).
+
+A kernel that scatters into copies cannot be checked on Metal, which asks for one copy and so never computes a nonzero offset. Forcing the count is what exercises it:
+
+```python
+from pydiffvg import render_metal as rm
+saved, rm._grad_replicas = rm._grad_replicas, lambda num_samples, nf: 64
+```
+
+Gradients taken with the count forced must match the ones taken without it. That test is worth running against a scene of one shape: the pools are padded, so a small scene is the case where the spacing of the copies differs from the length of the pool, and it is the case that broke when this was first written.
 
 ## Stroked circles and ellipses
 [Upstream issue #39](https://github.com/BachiLi/diffvg/issues/39) reports the wrong sign for the radius gradient on the inner flank of a stroked circle: the normal there points towards the centre while growing the radius pushes the flank outwards, so the velocity of Reynolds transport theorem needs the opposite sign. This fork already projects the radial velocity onto the normal, which gives the right sign on both flanks, and the ellipse form projects each axis of the velocity the same way. On a stroked shape of stroke width 6, the radius gradient of the two backends agrees with the C++ core to +0.34% for a circle and +0.16% for an ellipse, and neither shows the sign error of the report; those figures compare the implementations with each other, not with an exact reference, for the reason given above.

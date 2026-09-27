@@ -90,6 +90,9 @@ _SDF_FORWARD_SOURCE = _POSITION + """
 """
 
 _SDF_BACKWARD_SOURCE = _POSITION + """
+    int grad_reps = ip[IP_GRAD_REPLICAS] > 0 ? ip[IP_GRAD_REPLICAS] : 1;
+    int grad_stride = ip[IP_GRAD_STRIDE] > 0 ? ip[IP_GRAD_STRIDE] : ip[IP_NUM_FLOATS];
+    int grad_base = (int(idx) % grad_reps) * grad_stride;
     float d_dist = use_eval ? d_sdf[idx] : d_sdf[y * width + x];
     if (ip[IP_NUM_GROUPS] > 0 && d_dist != 0) {
         SdfResult r;
@@ -100,7 +103,7 @@ _SDF_BACKWARD_SOURCE = _POSITION + """
             float2 d_t = float2(0);
             d_compute_distance(s, r.group_id, r.shape_id, cpt, r.closest_pt, r.info, d_abs_dist, g, d_t);
             for (int k = 0; k < g.n; k++) {
-                DVG_ADD(d_floats, g.idx[k], g.val[k]);
+                DVG_ADD(d_floats, grad_base + g.idx[k], g.val[k]);
             }
             if (opts[PF_OPT_WANT_TRANSLATION] != 0 && x >= 0 && x < width && y >= 0 && y < height) {
                 int o = 2 * (y * width + x);
@@ -159,6 +162,9 @@ _PREFILTER_FORWARD_SOURCE = _PREFILTER_COMMON + """
 """
 
 _PREFILTER_BACKWARD_SOURCE = _PREFILTER_COMMON + """
+    int grad_reps = ip[IP_GRAD_REPLICAS] > 0 ? ip[IP_GRAD_REPLICAS] : 1;
+    int grad_stride = ip[IP_GRAD_STRIDE] > 0 ? ip[IP_GRAD_STRIDE] : ip[IP_NUM_FLOATS];
+    int grad_base = (int(idx) % grad_reps) * grad_stride;
     float4 d_color = gather_d_color(s, d_render_image, weight_image, pt);
     float2 d_t = float2(0);
     float3 d_curr_color = DVG_XYZ(d_color);
@@ -184,7 +190,7 @@ _PREFILTER_BACKWARD_SOURCE = _PREFILTER_COMMON + """
             gw_clear(g);
             pf_d_fragment(s, fragments[i], cpt, d_color_i, d_alpha_i, g, d_t);
             for (int k = 0; k < g.n; k++) {
-                DVG_ADD(d_floats, g.idx[k], g.val[k]);
+                DVG_ADD(d_floats, grad_base + g.idx[k], g.val[k]);
             }
             d_curr_color = d_prev_color;
             d_curr_alpha = d_prev_alpha;
@@ -227,8 +233,14 @@ _PREFILTER_BACKWARD_SOURCE = _PREFILTER_COMMON + """
             }
         }
     }
-    DVG_ADD(d_floats, ip[IP_FILTER_RADIUS_OFF], d_radius);
+    DVG_ADD(d_floats, grad_base + ip[IP_FILTER_RADIUS_OFF], d_radius);
 """
+
+# Slots naming the copies of the gradient pool and their spacing. Declared for
+# every kernel here, forward ones included, so that the shared prefixes compile
+# whichever kernel they end up in.
+_GRAD_CONSTANTS = (('IP_GRAD_REPLICAS', rm.IP_GRAD_REPLICAS),
+                   ('IP_GRAD_STRIDE', rm.IP_GRAD_STRIDE))
 
 _KERNEL_DEFS = {
     'sdf_forward': (['ip', 'ints', 'floats', 'eval_positions', 'opts'], ['sdf_image'], _SDF_FORWARD_SOURCE),
@@ -245,14 +257,20 @@ _KERNEL_DEFS = {
 def _kernel(name):
     """ The kernel for the active GPU backend (built once, cached there). """
     inputs, outputs, source = _KERNEL_DEFS[name]
-    return gb.kernel(name, inputs, outputs, source, _HEADER_FILES)
+    return gb.kernel(name, inputs, outputs, source, _HEADER_FILES, _GRAD_CONSTANTS)
 
 
 # ---------------------------------------------------------------------------
 # Flat-pool level (numpy pools from export_flat)
 
-def _fill_ip(ip, width, height, nsx, nsy, seed, use_prefiltering, has_background, num_eval):
+def _fill_ip(ip, width, height, nsx, nsy, seed, use_prefiltering, has_background, num_eval,
+             grad_replicas = 1, grad_stride = 0):
     ip = np.array(ip, dtype = np.int32, copy = True)
+    # Copies of the gradient pool the backward kernels scatter into, and their
+    # spacing; see render_metal.IP_GRAD_REPLICAS. One copy writes exactly where
+    # the pool used to be, which is what the forward kernels and Metal ask for.
+    ip[rm.IP_GRAD_REPLICAS] = grad_replicas
+    ip[rm.IP_GRAD_STRIDE] = grad_stride
     ip[ms.IP_W] = width
     ip[ms.IP_H] = height
     ip[ms.IP_NSX] = nsx
@@ -314,10 +332,12 @@ def sdf_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed, d_sdf,
                       eval_positions = None, want_translation = False, use_prefiltering = False):
     """ Returns (d_floats (len(floats),), d_translation (H, W, 2) or None). """
     ev, n_eval = _eval_array(eval_positions)
-    ip_m = _fill_ip(ip, width, height, nsx, nsy, seed, use_prefiltering, False, n_eval)
     ints_m, floats_m = _pools(ints, floats)
     n = n_eval if n_eval > 0 else width * height * nsx * nsy
     nf = int(floats_m.size)
+    reps = rm._grad_replicas(n, nf)
+    ip_m = _fill_ip(ip, width, height, nsx, nsy, seed, use_prefiltering, False, n_eval,
+                    grad_replicas = reps, grad_stride = nf)
     if n == 0:
         return (mx.zeros((nf,)), mx.zeros((height, width, 2)) if want_translation else None)
     d_sdf_m = rm._pad(_as_mx(d_sdf))
@@ -325,8 +345,9 @@ def sdf_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed, d_sdf,
     d_floats, d_trans = _kernel('sdf_backward')(
         inputs = [ip_m, ints_m, floats_m, ev, _opts(want_translation), d_sdf_m],
         grid = (n, 1, 1),
-        output_shapes = [(nf,), (nt,)], output_dtypes = [mx.float32, mx.float32],
+        output_shapes = [(nf * reps,), (nt,)], output_dtypes = [mx.float32, mx.float32],
         init_value = 0)
+    d_floats = rm._fold_replicas(d_floats, reps, nf)
     return d_floats, (d_trans[:2 * width * height].reshape(height, width, 2) if want_translation else None)
 
 
@@ -390,10 +411,13 @@ def prefiltered_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
         recomputed when None. weight_image: see prefiltered_weight_flat.
     """
     has_bg = background_image is not None
-    ip_m = _fill_ip(ip, width, height, nsx, nsy, seed, True, has_bg, 0)
     ints_m, floats_m = _pools(ints, floats)
     n = width * height * nsx * nsy
     nf = int(floats_m.size)
+    reps = rm._grad_replicas(n, nf)
+    # The forward and weight kernels share this pool and ignore the two slots.
+    ip_m = _fill_ip(ip, width, height, nsx, nsy, seed, True, has_bg, 0,
+                    grad_replicas = reps, grad_stride = nf)
     npx = width * height
     if n == 0:
         return (mx.zeros((nf,)), mx.zeros((height, width, 4)) if has_bg else None,
@@ -415,8 +439,9 @@ def prefiltered_backward_flat(ip, ints, floats, width, height, nsx, nsy, seed,
         inputs = [ip_m, ints_m, floats_m, weight, _background_m(background_image, width, height),
                   _opts(want_translation, exact_scan), d_img, fwd_img],
         grid = (n, 1, 1),
-        output_shapes = [(nf,), (nb,), (nt,)], output_dtypes = [mx.float32] * 3,
+        output_shapes = [(nf * reps,), (nb,), (nt,)], output_dtypes = [mx.float32] * 3,
         init_value = 0)
+    d_floats = rm._fold_replicas(d_floats, reps, nf)
     return (d_floats,
             d_bg[:4 * npx].reshape(height, width, 4) if has_bg else None,
             d_trans[:2 * npx].reshape(height, width, 2) if want_translation else None)
