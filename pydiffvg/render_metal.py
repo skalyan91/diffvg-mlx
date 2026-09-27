@@ -40,6 +40,47 @@ _MIN_BUFFER = 8  # on Metal, smaller inputs arrive in the `constant` address spa
 # ip slot used by the backward kernels only (slots 32-63 are free): 1 when the
 # screen-space translation gradient image is requested.
 IP_WANT_D_TRANSLATION = 32
+# Copies of the gradient pool the backward kernels scatter into. A float atomic
+# add loses accuracy once one accumulator takes millions of additions: measured
+# through DVG_ADD itself, 4,194,304 increments of 5.99e-05 summing to 251.3274
+# come out 1.548% high on CUDA, and exact on Metal. Spreading the additions over
+# several copies of the pool and summing those afterwards shortens every
+# accumulation by the number of copies, as the chunked drain does for the C++
+# core (render() in diffvg.cpp).
+IP_GRAD_REPLICAS = 33
+# Distance between those copies, in floats. It is the length of the gradient
+# buffer the host folds, which is NOT ip[IP_NUM_FLOATS]: the pools are padded to
+# a minimum length, so a small scene has a buffer longer than the pool it holds
+# (measured: one circle gives 64 against 40). Both sides must step by the same
+# number or the copies land on top of each other.
+IP_GRAD_STRIDE = 34
+
+_GRAD_ADDS_PER_REPLICA = 32768
+_MAX_GRAD_REPLICAS = 64
+_MAX_GRAD_POOL = 8 << 20        # floats; the replicas cost at most ~32 MB
+
+
+def _grad_replicas(num_samples, nf):
+    """
+        Copies of the gradient pool to scatter into. One copy leaves the
+        kernels writing exactly where they wrote before; only CUDA needs more.
+    """
+    if gb.get_gpu_backend() != 'cuda' or num_samples <= _GRAD_ADDS_PER_REPLICA:
+        return 1
+    reps = min(_MAX_GRAD_REPLICAS,
+               (num_samples + _GRAD_ADDS_PER_REPLICA - 1) // _GRAD_ADDS_PER_REPLICA)
+    while reps > 1 and nf * reps > _MAX_GRAD_POOL:
+        reps //= 2
+    return max(1, int(reps))
+
+
+def _fold_replicas(d_floats, reps, nf):
+    """ Sums the copies of the gradient pool the kernels scattered into. """
+    if reps <= 1:
+        return d_floats
+    return d_floats[:reps * nf].reshape(reps, nf).sum(axis = 0)
+
+
 # Boundary sample record strides (sample_boundary kernel outputs)
 BS_F_STRIDE = 13
 BS_I_STRIDE = 5
@@ -151,6 +192,11 @@ _RENDER_COLOR_SOURCE = """
 _RENDER_COLOR_BACKWARD_SOURCE = """
     DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
+    // Scatter the gradients over IP_GRAD_REPLICAS copies of the pool; the host
+    // sums them. One copy writes exactly where the pool used to be.
+    int grad_reps = ip[IP_GRAD_REPLICAS] > 0 ? ip[IP_GRAD_REPLICAS] : 1;
+    int grad_stride = ip[IP_GRAD_STRIDE] > 0 ? ip[IP_GRAD_STRIDE] : ip[IP_NUM_FLOATS];
+    int grad_base = (int(idx) % grad_reps) * grad_stride;
     int width = ip[IP_W];
     int height = ip[IP_H];
     int x = 0;
@@ -205,7 +251,7 @@ _RENDER_COLOR_BACKWARD_SOURCE = """
                                      group_fill_num_stops(s, gid), cpt, d_ci, g, d_translation_px);
             }
             for (int k = 0; k < g.n; k++) {
-                DVG_ADD(d_floats, g.idx[k], g.val[k]);
+                DVG_ADD(d_floats, grad_base + g.idx[k], g.val[k]);
             }
         }
         if (has_bg) {
@@ -248,7 +294,7 @@ _RENDER_COLOR_BACKWARD_SOURCE = """
             }
         }
     }
-    DVG_ADD(d_floats, ip[IP_FILTER_RADIUS_OFF], d_radius);
+    DVG_ADD(d_floats, grad_base + ip[IP_FILTER_RADIUS_OFF], d_radius);
 """
 
 _SAMPLE_BOUNDARY_SOURCE = """
@@ -293,6 +339,11 @@ _SAMPLE_BOUNDARY_SOURCE = """
 _RENDER_EDGE_SOURCE = """
     DVG_THREAD_INDEX;
     SceneView s = make_scene_view(floats, ints, ip);
+    // Scatter the gradients over IP_GRAD_REPLICAS copies of the pool; the host
+    // sums them. One copy writes exactly where the pool used to be.
+    int grad_reps = ip[IP_GRAD_REPLICAS] > 0 ? ip[IP_GRAD_REPLICAS] : 1;
+    int grad_stride = ip[IP_GRAD_STRIDE] > 0 ? ip[IP_GRAD_STRIDE] : ip[IP_NUM_FLOATS];
+    int grad_base = (int(idx) % grad_reps) * grad_stride;
     int fo = BS_F_STRIDE * int(idx);
     int io = BS_I_STRIDE * int(idx);
     int shape_id = bs_i[io + 1];
@@ -369,7 +420,7 @@ _RENDER_EDGE_SOURCE = """
     accumulate_boundary_gradient(s, shape_id, contrib, t, local_normal, data, shape_group_id,
                                  local_boundary_pt, normal, local_velocity_scale, g);
     for (int k = 0; k < g.n; k++) {
-        DVG_ADD(d_floats, g.idx[k], g.val[k]);
+        DVG_ADD(d_floats, grad_base + g.idx[k], g.val[k]);
     }
     if (ip[IP_WANT_D_TRANSLATION] != 0) {
         DVG_ADD(d_translation, 2 * pix, normal.x * contrib);
@@ -380,6 +431,8 @@ _RENDER_EDGE_SOURCE = """
 # Compile-time constants the backward kernel bodies reference; gpu_backend
 # spells them for each backend (constant / static constexpr).
 _BACKWARD_CONSTANTS = (('IP_WANT_D_TRANSLATION', IP_WANT_D_TRANSLATION),
+                       ('IP_GRAD_REPLICAS', IP_GRAD_REPLICAS),
+                       ('IP_GRAD_STRIDE', IP_GRAD_STRIDE),
                        ('BS_F_STRIDE', BS_F_STRIDE),
                        ('BS_I_STRIDE', BS_I_STRIDE))
 
@@ -597,11 +650,13 @@ def render_backward_prepared(flat, d_render_image, want_translation = False, edg
         return (mx.zeros((nf,), dtype = mx.float32),
                 mx.zeros((height, width, 4), dtype = mx.float32) if has_bg else None,
                 mx.zeros((height, width, 2), dtype = mx.float32) if want_translation else None)
-    ip_m = flat['ip_m']
+    reps = _grad_replicas(num_samples, nf)
+    ip_w = np.array(flat['ip'], copy = True)
     if want_translation:
-        ip = np.array(flat['ip'], copy = True)
-        ip[IP_WANT_D_TRANSLATION] = 1
-        ip_m = _pad(mx.array(ip))
+        ip_w[IP_WANT_D_TRANSLATION] = 1
+    ip_w[IP_GRAD_REPLICAS] = reps
+    ip_w[IP_GRAD_STRIDE] = nf
+    ip_m = _pad(mx.array(ip_w))
     ip = flat['ip']
     num_pixels = width * height
     d_img = _pad(mx.array(d_render_image).astype(mx.float32) if not isinstance(d_render_image, mx.array)
@@ -614,9 +669,10 @@ def render_backward_prepared(flat, d_render_image, want_translation = False, edg
         inputs = [ip_m, flat['ints_m'], flat['floats_m'], flat['weight_image'], d_weight_image,
                   d_img, flat['bg_m']],
         grid = grid,
-        output_shapes = [(nf,), (bg_size,), (tr_size,)],
+        output_shapes = [(nf * reps,), (bg_size,), (tr_size,)],
         output_dtypes = [mx.float32, mx.float32, mx.float32],
         init_value = 0)
+    d_floats = _fold_replicas(d_floats, reps, nf)
     # Edge sampling (skipped for empty scenes and zero total boundary length,
     # like the CPU)
     if edges and flat['has_edges']:
@@ -632,10 +688,10 @@ def render_backward_prepared(flat, d_render_image, want_translation = False, edg
             inputs = [ip_m, flat['ints_m'], flat['floats_m'], bs_f, bs_i, flat['weight_image'],
                       d_img, flat['bg_m']],
             grid = grid,
-            output_shapes = [(nf,), (tr_size,)],
+            output_shapes = [(nf * reps,), (tr_size,)],
             output_dtypes = [mx.float32, mx.float32],
             init_value = 0)
-        d_floats = d_floats + d_floats_e
+        d_floats = d_floats + _fold_replicas(d_floats_e, reps, nf)
         if want_translation:
             d_translation = d_translation + d_translation_e
     d_bg = d_background[:4 * num_pixels].reshape(height, width, 4) if has_bg else None
